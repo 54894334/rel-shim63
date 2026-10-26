@@ -252,7 +252,7 @@
 
 #define RB_START_SETTLE_SEC  30.0    // 拉起后这么多秒内不判假连接
 
-#define RB_START_STUCK_SEC   90.0    // 一直停在「连接中」超过这么久才算卡死
+#define RB_START_STUCK_SEC   45.0    // 一直停在「连接中」超过这么久才算卡死（v66：45 秒就 bounce）
 
 #define RB_REFRESH_MB        5       // 抹除后跑掉这么多 MB 就认为额度已刷新（补刀复核用）
 
@@ -669,7 +669,28 @@ static volatile uint64_t gSrvUsed  = 0;   // 服务端报的已用（字节）
 
 static volatile double   gSrvTs    = 0;   // 上次收到额度报文的时刻
 
+static volatile uint64_t gSrvAccAt = 0;   // 收到服务端读数那一刻的本地累计（v66）
+
+static volatile uint64_t gFlowAcc = 0;   // 当前累计 VPN 流量（面板显示用；v66 上移供 rb_used_est 用）
+
 static uint64_t rb_pb_prev_used = 0;      // 去重打日志用
+
+// v66：面板显示的「已用」= 服务端基准 + 服务端读数之后本地又跑的部分。
+// 只显示服务端会滞后（一分钟一报，App 那边早跑到 288 了面板还 240）；
+// 只显示本地 utun 会在重建时漏算。两者相加：基准是权威账单，增量是实时的。
+static uint64_t rb_used_est(void) {
+
+    uint64_t base = gSrvUsed;
+
+    if (base == 0) return gFlowAcc;
+
+    uint64_t acc = gFlowAcc;
+
+    uint64_t since = (acc > gSrvAccAt) ? (acc - gSrvAccAt) : 0;
+
+    return base + since;
+
+}
 
 
 
@@ -792,6 +813,8 @@ static BOOL rb_pb_dead(const uint8_t *b, size_t n, int depth, size_t *budget) {
 
         gSrvTs    = rb_now();
 
+        gSrvAccAt = gFlowAcc;
+
         if (f3 > rb_pb_prev_used + (1ULL << 20) ||
             f3 + (1ULL << 20) < rb_pb_prev_used ||
             rb_pb_prev_used == 0) {
@@ -806,6 +829,95 @@ static BOOL rb_pb_dead(const uint8_t *b, size_t n, int depth, size_t *budget) {
     }
 
     return NO;
+
+}
+
+
+
+// v66：v30 时代读用量的老路 —— f1=35 心跳载荷（首字节 08 23）里，
+// "DATA_" 锚点后面就是 f2=quota、f3=used。这种包服务端每次心跳都回，
+// 更新非常勤（v29 实测 37.8->132->240->300 秒级跟进）。v65 只靠 len=253
+// 那种包更新，一分钟才一两次，面板显示自然滞后几十 MB。
+static void rb_scan_used35(const uint8_t *b, size_t n) {
+
+    if (!b || n < 60 || b[0] != 0x08 || b[1] != 0x23) return;
+
+    if (n > 8192) return;
+
+    for (size_t i = 4; i + 24 <= n; i++) {
+
+        if (memcmp(b + i, "DATA_", 5)) continue;
+
+        if (b[i - 2] != 0x0a) continue;                  // 锚点前应是 f1 的 tag+len
+
+        size_t L2 = b[i - 1];
+
+        size_t p = i + L2;                               // token 结束
+
+        if (p >= n || b[p] != 0x10) return;              // f2 = quota
+
+        uint64_t quota = 0, used = 0;
+
+        size_t sh = 0;
+
+        p++;
+
+        while (p < n && sh <= 56) { uint8_t c = b[p++];
+
+            quota |= (uint64_t)(c & 0x7f) << sh; sh += 7;
+
+            if (!(c & 0x80)) break; }
+
+        if (quota < (uint64_t)RB_MIN_QUOTA || quota > (uint64_t)RB_MAX_QUOTA)
+
+            return;
+
+        if (p >= n || b[p] != 0x18) {
+
+            used = 0;                                    // proto3 零值不落地 = 没用
+
+        } else {
+
+            p++; sh = 0;
+
+            while (p < n && sh <= 56) { uint8_t c = b[p++];
+
+                used |= (uint64_t)(c & 0x7f) << sh; sh += 7;
+
+                if (!(c & 0x80)) break; }
+
+            if (sh > 63) return;
+
+        }
+
+        if (used > quota + quota / 20) return;           // used 不会远超 quota
+
+        gSrvTotal = quota;
+
+        gSrvUsed  = used;
+
+        gSrvTs    = rb_now();
+
+        gSrvAccAt = gFlowAcc;
+
+        static uint64_t prev35 = 0;
+
+        if (used != prev35 && (used > prev35 + (1ULL<<20) ||
+                               used + (1ULL<<20) < prev35)) {
+
+            prev35 = used;
+
+            rb_log("服务端额度（心跳）：共 %.1f MB，已用 %.1f MB，剩 %.1f MB",
+
+                   (double)quota / 1048576.0, (double)used / 1048576.0,
+
+                   (double)(quota - used) / 1048576.0);
+
+        }
+
+        return;
+
+    }
 
 }
 
@@ -826,6 +938,10 @@ static BOOL rb_dead(const uint8_t *b, size_t n) {
         if (rb_text_dead(b, n)) return YES;
 
     }
+
+    // v66：f1=35 心跳包里的 quota/used（高频），面板显示与触发判据都用它
+
+    rb_scan_used35(b, n);
 
     // ③ protobuf 二进制形态。
 
@@ -862,8 +978,6 @@ static volatile double   gBootAt = 0;
 static volatile int      gStopped = 0;   // 熔断/闪退循环 → 1，之后只记日志
 
 static volatile int      gFastLane = 0;  // 刚抹完重开 → 1，用更短的宽限/冷却
-
-static volatile uint64_t gFlowAcc = 0;   // 当前累计 VPN 流量（面板显示用）
 
 static NSString         *gLastWhy = nil;
 
@@ -1859,6 +1973,12 @@ static void rb_node_files_restore(void) {
 
             NSString *full = [dir stringByAppendingPathComponent:it];
 
+            // v66：App 自己已经写好的节点文件不覆盖 —— 用户刚手选的新节点
+            // 不能被我们写回的旧节点冲掉。只救「抹掉了、还没长回来」的空位。
+            NSDictionary *ex = [fm attributesOfItemAtPath:full error:NULL];
+
+            if (ex && [ex fileSize] > 0) continue;
+
             [fm createDirectoryAtPath:[full stringByDeletingLastPathComponent]
 
                  withIntermediateDirectories:YES attributes:nil error:NULL];
@@ -2586,7 +2706,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v65 节点导出\n"];
+        [out appendString:@"# rb-shim v66 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -3262,11 +3382,20 @@ static void rb_start_vpn_once(int force) {
 
                                   rb_now() - gLastTrafficTs < 45.0);
 
-                    if (fresh) {
+                    // v66：fresh 免检只许用在「已连接(3)」上。
+                    // v65 日志 117 行实锤：状态 2 卡死转圈时 gLastTrafficTs
+                    // 一直被刷新，fresh 恒真 -> 永远「不动」-> 卡转圈。
+                    if (fresh && st2 == 3) {
 
-                        rb_log("自动连接：配置自带状态 %d 且 45 秒内有流量，不动", st2);
+                        rb_log("自动连接：已连接且有流量（45 秒内），不动");
 
                         return;
+
+                    }
+
+                    if (fresh && st2 != 3) {
+
+                        rb_log("自动连接：状态 %d 不是已连接，有流量也不免检，走卡死判定", st2);
 
                     }
 
@@ -3340,11 +3469,17 @@ static void rb_start_vpn_once(int force) {
 
                     rb_log("自动连接：配置自带状态 %d、距上次拉起 %.0f 秒仍零流量 —— "
 
-                           "判定假连接（第 %d/%d 次），先停，%.1f 秒后重拉",
+                           "判定假连接（第 %d/%d 次），先补节点文件，%.1f 秒后重拉",
 
                            st2, since, gFakeFixCount, RB_FAKE_FIX_MAX,
 
                            (double)RB_STOP_SETTLE_SEC);
+
+                    // v66：bounce 前把节点文件补齐 —— provider 重拉时要读它，
+
+                    // 文件不在就永远卡「连接中」（v65 日志 101->105 行顺序实锤）
+
+                    rb_node_files_restore();
 
                     rb_stop_vpn();
 
@@ -3909,12 +4044,12 @@ static void rb_flow_tick(void) {
                        "归零命中 %d 次，已抹除 %d 次，距上次抹除 %.0f 秒（重建 %d 次）",
 
                        (gSrvTotal > 0) ? "服务端" : "本地",
-                       (gSrvTotal > 0) ? (double)gSrvUsed / 1048576.0
+                       (gSrvTotal > 0) ? (double)rb_used_est() / 1048576.0
                                        : (double)acc / 1048576.0,
                        (gSrvTotal > 0) ? (double)gSrvTotal / 1048576.0
                                        : (double)rb_quota_limit() / 1048576.0,
                        (gSrvTotal > 0)
-                           ? (double)(gSrvTotal - gSrvUsed) / 1048576.0
+                           ? (double)(gSrvTotal - rb_used_est()) / 1048576.0
                            : (double)(rb_quota_limit() - acc) / 1048576.0,
                        acc / 1048576.0, gRateKBps,
 
@@ -3932,12 +4067,12 @@ static void rb_flow_tick(void) {
                        "归零命中 %d 次，已抹除 %d 次（从未抹除）（重建 %d 次）",
 
                        (gSrvTotal > 0) ? "服务端" : "本地",
-                       (gSrvTotal > 0) ? (double)gSrvUsed / 1048576.0
+                       (gSrvTotal > 0) ? (double)rb_used_est() / 1048576.0
                                        : (double)acc / 1048576.0,
                        (gSrvTotal > 0) ? (double)gSrvTotal / 1048576.0
                                        : (double)rb_quota_limit() / 1048576.0,
                        (gSrvTotal > 0)
-                           ? (double)(gSrvTotal - gSrvUsed) / 1048576.0
+                           ? (double)(gSrvTotal - rb_used_est()) / 1048576.0
                            : (double)(rb_quota_limit() - acc) / 1048576.0,
                        acc / 1048576.0, gRateKBps,
 
@@ -5248,7 +5383,7 @@ static NSString *rb_status_text(void) {
 
         @"日志：文件 App → RelyVPN → %@",
 
-        (gSrvTotal > 0) ? (double)gSrvUsed / 1048576.0
+        (gSrvTotal > 0) ? (double)rb_used_est() / 1048576.0
                         : (double)gFlowAcc / 1048576.0,
         (gSrvTotal > 0) ? (double)gSrvTotal / 1048576.0
                         : (double)rb_quota_limit() / 1048576.0,
@@ -5947,6 +6082,13 @@ static void rb_init(void) {
 
         gBootAt = rb_now();
 
+        // v66：节点文件/配置键的恢复提到第一行同步做 —— 之前放在 10 秒后，
+        // 但系统 on-demand 在 1 秒内就把隧道拉起了（v65 日志 101->105 行），
+        // provider 起来时节点文件还没写回 → 永远卡「连接中」。
+        rb_node_files_restore();
+
+        rb_prefs_restore();
+
         double now = gBootAt;
 
 
@@ -5985,13 +6127,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v65 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v66 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v65 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v66 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
