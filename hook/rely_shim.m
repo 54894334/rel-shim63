@@ -225,6 +225,7 @@
 // 正常是 8000+ KB/s）。所以抹完之后要「查一遍速率」，被限速就把旧节点丢掉，
 // 让 App 用新身份重新申请节点。
 #define RB_NODE_ROTATE_ON    1          // 1=开（0=关，退回v66行为）
+#define RB_NODE_SELF_SEC     180.0      // 抹除后这么久内算「刚抹完」→ 不写回旧节点，让 App 自己选
 #define RB_NODE_LIMIT_KBPS   500.0      // 抹后持续低于这个速率（KB/s）判为节点被限速
 #define RB_NODE_OBS_SEC      20.0       // 观测窗口：连着这么久都低速才动手
 #define RB_NODE_OBS_ARM_SEC  8.0        // 抹完前这些秒不算（隧道在握手、本来就没速度）
@@ -1967,6 +1968,53 @@ static void rb_node_files_snapshot(void) {
 
 // 抹之后：目录被删了，重建并把节点文件写回去
 
+// v68：这次启动是不是「刚抹完数据」起来的。
+// 是的话就不写回旧节点：旧 currentNodeWithReason.bin 里的节点认证串是旧账号签发的，
+// 写回去 = 同一条旧身份继续用 → 服务端按老账本压成福利限速。
+// rb-shim(12) 第 10~14 行反过来证明：没有节点文件时 App 会自己按服务端下发选节点。
+static BOOL rb_just_wiped(void) {
+
+    @try {
+
+        NSDictionary *st = rb_state();
+
+        if ([[st objectForKey:@"pendingStart"] boolValue]) return YES;
+
+        double lw = [[st objectForKey:@"lastWipeTs"] doubleValue];
+
+        return (lw > 0 && rb_now() - lw < RB_NODE_SELF_SEC);
+
+    } @catch (NSException *e) { return NO; }
+
+}
+
+
+
+static void rb_node_files_restore(void);   // v68 前向声明（下面的 _direct 要用）
+
+// 不论是不是刚抹完、都真的写一次（bounce 兜底用）
+static BOOL rb_node_files_restore_direct(void) {
+
+    @try {
+
+        NSDictionary *pick = [rb_state() objectForKey:RB_NODEFILES_KEY];
+
+        if ([pick isKindOfClass:[NSDictionary class]] && [pick count] > 0) {
+
+            rb_node_files_restore();
+
+            return YES;
+
+        }
+
+    } @catch (NSException *e) { }
+
+    return NO;
+
+}
+
+
+
 static void rb_node_files_restore(void) {
 
     @try {
@@ -2254,15 +2302,15 @@ static int rb_wipe_all(void) {
 
 
 
-    // v64：上面把 NSUserDefaults 全清了（连带 Flutter 记的「当前节点」），
+    // v68：这里**不再**立刻把旧节点写回去。
+    // 旧 currentNodeWithReason.bin 带着旧账号签发的节点认证串，写回去就是
+    // 「新额度 + 旧身份」——服务端按老账本压成福利限速（v66 日志：抹后 82 秒
+    // 只跑 0.7MB、10.8 KB/s）。反过来，rb-shim(12) 第 10~14 行证明：没有节点
+    // 文件时 App 会自己按服务端下发选节点，照样连得上、跑得出流量。
+    // 快照仍然留着，只有真卡住（45 秒还在连接中）才由 bounce 兜底写回。
 
-    // 这里立刻把节点类键写回去 —— 抹完的新进程就知道上次连的是哪个节点，
-
-    // 不用你手动点。身份键一个都不恢复，所以额度照样刷新。
-
-    rb_prefs_restore();
-
-    rb_node_files_restore();
+    rb_log("抹完是干净状态：不写回旧节点文件（旧认证串会被限速），"
+           "由 App 用新身份自己选；真的连不上 45 秒后才兜底");
 
 
 
@@ -2841,7 +2889,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v67 节点导出\n"];
+        [out appendString:@"# rb-shim v68 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -3614,7 +3662,16 @@ static void rb_start_vpn_once(int force) {
 
                     // 文件不在就永远卡「连接中」（v65 日志 101->105 行顺序实锤）
 
-                    rb_node_files_restore();
+                    // v68：这一步是「App 自己选不上」时的兜底，写回的是旧节点，
+
+                    // 有被限速的风险 —— 所以日志里写清楚，别再当成正常路径。
+
+                    if (rb_node_files_restore_direct()) {
+
+                        rb_log("兜底：补回旧节点文件（App 自己没选上）。旧节点带旧认证串，"
+                               "若被限速会触发上面的「节点体检」自动丢掉换新");
+
+                    }
 
                     rb_stop_vpn();
 
@@ -6289,12 +6346,25 @@ static void rb_init(void) {
 
         gBootAt = rb_now();
 
-        // v66：节点文件/配置键的恢复提到第一行同步做 —— 之前放在 10 秒后，
-        // 但系统 on-demand 在 1 秒内就把隧道拉起了（v65 日志 101->105 行），
-        // provider 起来时节点文件还没写回 → 永远卡「连接中」。
-        rb_node_files_restore();
+        if (rb_just_wiped()) {
 
-        rb_prefs_restore();
+            // v68：刚抹完 —— 不写回旧节点，让 App 用新身份自己选。
+            rb_log("这次是抹数据后启动：不写回旧节点文件，让 App 用新身份重新选"
+                   "（旧节点认证串 = 限速根因）");
+
+            // App 一旦自己定下来（重写 currentNodeWithReason.bin），立刻拉隧道
+            rb_node_watch_new(RB_NODE_WATCH_MAX);
+
+        } else {
+
+            // v66：节点文件/配置键的恢复提到第一行同步做 —— 之前放在 10 秒后，
+            // 但系统 on-demand 在 1 秒内就把隧道拉起了（v65 日志 101->105 行），
+            // provider 起来时节点文件还没写回 → 永远卡「连接中」。
+            rb_node_files_restore();
+
+            rb_prefs_restore();
+
+        }
 
         double now = gBootAt;
 
@@ -6334,13 +6404,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v67 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v68 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v67 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v68 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
@@ -6495,7 +6565,7 @@ static void rb_init(void) {
         if (rb_auto_on()) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            @autoreleasepool { rb_node_files_restore(); rb_prefs_restore();
+            @autoreleasepool { if (!rb_just_wiped()) { rb_node_files_restore(); rb_prefs_restore(); }
                                rb_prefs_dump(); rb_export_nodes(); }
         });
 
