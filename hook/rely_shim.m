@@ -1080,6 +1080,10 @@ static void rb_node_rotate(void);
 
 static void rb_node_watch_new(int left);
 
+static void rb_ne_drop_configs(const char *why);
+
+static void rb_ne_watch_config(int left);
+
 static void rb_panel_refresh(void);
 
 #if !RB_PANEL
@@ -2067,6 +2071,124 @@ static void rb_node_files_restore(void) {
 
 
 
+// v69：把系统里建好的 VPN 配置删干净。
+// 配置里的 providerConfiguration 带着旧节点地址与凭据（抹 App 数据不会动系统配置），
+// 只要配置还在，隧道起来就一定连回旧节点 —— 这就是「抹完了还是限速」的根。
+// rb-shim(13) 第 10~17 行对照：全新进程没有配置，App 自己建，一路跑到 300MB 归零。
+static void rb_ne_drop_configs(const char *why) {
+
+    @try {
+
+        Class C = objc_getClass("NETunnelProviderManager");
+
+        if (!C) { rb_log("%s：这台机器上没有 NETunnelProviderManager", why); return; }
+
+        void (^h)(NSArray *, NSError *) = ^(NSArray *mans, NSError *err) {
+
+            (void)err;
+
+            if (!mans) return;
+
+            if ([mans count] == 0) {
+
+                rb_log("%s：当前 0 个 VPN 配置，无需删除", why);
+
+                return;
+
+            }
+
+            int n = 0;
+
+            SEL rm = sel_registerName("removeFromPreferencesWithCompletionHandler:");
+
+            for (id m in mans) {
+
+                @try {
+
+                    if ([m respondsToSelector:rm]) {
+
+                        ((void (*)(id, SEL, void (^)(NSError *)))objc_msgSend)(
+
+                            m, rm, ^(NSError *e) { (void)e; });
+
+                        n++;
+
+                    }
+
+                } @catch (NSException *e) { }
+
+            }
+
+            rb_log("%s：已删掉 %d 个 VPN 配置 —— providerConfiguration 里的旧节点凭据"
+                   "一起清掉，状态回到全新安装（速率才不会按旧账本压）", why, n);
+
+        };
+
+        ((void (*)(id, SEL, void (^)(NSArray *, NSError *)))objc_msgSend)(
+
+            C, sel_registerName("loadAllFromPreferencesWithCompletionHandler:"), h);
+
+    } @catch (NSException *e) {
+
+        rb_log("清理 VPN 配置失败：%s", [[e reason] UTF8String]);
+
+    }
+
+}
+
+
+
+// App 重新把 VPN 配置建回来之后立刻接上（不然它建好了也没人替它按连接）
+static void rb_ne_watch_config(int left) {
+
+    if (left <= 0) return;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5 * NSEC_PER_SEC)),
+
+                   dispatch_get_main_queue(), ^{
+
+        @autoreleasepool {
+
+            @try {
+
+                Class C = objc_getClass("NETunnelProviderManager");
+
+                if (C) {
+
+                    void (^h)(NSArray *, NSError *) = ^(NSArray *mans, NSError *err) {
+
+                        (void)err;
+
+                        if (mans && [mans count] > 0) {
+
+                            rb_log("检测到 App 已重新建立 VPN 配置（%lu 个），立刻拉起隧道",
+
+                                   (unsigned long)[mans count]);
+
+                            rb_start_vpn_once(1);
+
+                        }
+
+                    };
+
+                    ((void (*)(id, SEL, void (^)(NSArray *, NSError *)))objc_msgSend)(
+
+                        C, sel_registerName("loadAllFromPreferencesWithCompletionHandler:"), h);
+
+                }
+
+            } @catch (NSException *e) { }
+
+            rb_ne_watch_config(left - 1);
+
+        }
+
+    });
+
+}
+
+
+
 // v67：丢掉旧节点文件和保活快照 —— App 下次要连就会以新身份重新申请节点凭据。
 // 快照也必须一起清，不然下一次 boot/卡连接兜底又会把它写回来，白丢一次。
 static void rb_node_rotate(void) {
@@ -2097,8 +2219,25 @@ static void rb_node_rotate(void) {
 
         rb_state_save(st);
 
+        if (n == 0) {
+
+            // v69：rb-shim(13) 日志实证 —— 没有节点文件的时候 rotate 仍然照停照拉，
+            // 4 次下来把本来可能连上的隧道反复打断。没东西可删就别动隧道。
+            rb_log("换节点：没有旧节点文件可丢（App 还没选定节点文件）—— 不动隧道");
+
+            rb_ne_drop_configs("换节点（无节点文件）");
+
+            rb_ne_watch_config(60);
+
+            return;
+
+        }
+
         rb_log("换节点：删掉 %d 个旧节点文件、清掉保活快照 —— "
                "App 下次连接会用新身份重新申请节点凭据（旧认证串是限速根因）", n);
+
+        // v69：配置里那份旧节点凭据才是根，跟文件一起清
+        rb_ne_drop_configs("换节点");
 
         rb_stop_vpn();
 
@@ -2311,6 +2450,13 @@ static int rb_wipe_all(void) {
 
     rb_log("抹完是干净状态：不写回旧节点文件（旧认证串会被限速），"
            "由 App 用新身份自己选；真的连不上 45 秒后才兜底");
+
+    // v69：系统里的 VPN 配置也必须删 —— 它带着旧节点的 providerConfiguration，
+    // 留着就等于抹完还是连回旧节点（rb-shim(13) 第 45 行「读到 1 个配置」= 限速根）
+    rb_ne_drop_configs("抹除");
+
+    // App 什么时候把配置建回来不知道，盯着，一建好就替它按连接
+    rb_ne_watch_config(120);
 
 
 
@@ -2889,7 +3035,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v68 节点导出\n"];
+        [out appendString:@"# rb-shim v69 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -6404,13 +6550,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v68 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v69 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v68 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v69 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
