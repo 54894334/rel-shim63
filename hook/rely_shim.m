@@ -72,6 +72,18 @@
 
 #import <objc/message.h>
 
+#import <sys/socket.h>
+
+#import <netinet/in.h>
+
+#import <arpa/inet.h>
+
+#import <netdb.h>
+
+#import <unistd.h>
+
+#import <sys/time.h>
+
 #include <mach-o/dyld.h>
 
 #include <dlfcn.h>          // dlopen / dlsym / dladdr
@@ -183,6 +195,15 @@
 #define RB_NODE_SNAP_KEY   @"nodeSnap"
 
 #define RB_NODE_RECHECK    30.0       // 两次恢复校验的最小间隔（秒）
+
+// v64：真正的「当前节点」不在 providerConfiguration（那里面只有 1 个键），
+// 而是在 Flutter 的 NSUserDefaults 里 —— 抹数据时被 removePersistentDomain 一起清掉，
+// 所以抹完 App 是「从没选过节点」的新状态，自动重连拉起隧道也连不上任何节点，
+// 只能手动点。这里抹前把「节点类」键挑出来快照，抹完写回去。
+
+#define RB_PREFS_SNAP_KEY  @"prefsSnap"
+
+#define RB_PREFS_FILE      @"rb-prefs.txt"
 
 
 
@@ -1283,6 +1304,350 @@ static int rb_kc_wipe(int aggressive) {
 
 
 
+#pragma mark - 节点保活（v64）
+
+
+
+// Flutter 的 shared_preferences 落在 NSUserDefaults：主 domain（bundle id）、
+
+// "flutter" domain、App Group suite 三处都可能存。全扫一遍。
+
+static NSArray *rb_prefs_domains(void) {
+
+    NSMutableArray *a = [NSMutableArray array];
+
+    NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
+
+    if (bid) [a addObject:bid];
+
+    [a addObject:@"flutter"];
+
+    [a addObject:RB_GROUP_ID];
+
+    return a;
+
+}
+
+
+
+// rb_state.plist 是 plist，存进去的必须是 plist 能表达的类型
+
+static BOOL rb_plist_ok(id v) {
+
+    if ([v isKindOfClass:[NSString class]] || [v isKindOfClass:[NSNumber class]] ||
+
+        [v isKindOfClass:[NSData class]]   || [v isKindOfClass:[NSDate class]]) return YES;
+
+    if ([v isKindOfClass:[NSArray class]]) {
+
+        for (id x in (NSArray *)v) if (!rb_plist_ok(x)) return NO;
+
+        return YES;
+
+    }
+
+    if ([v isKindOfClass:[NSDictionary class]]) {
+
+        NSDictionary *d = (NSDictionary *)v;
+
+        for (id k in d) {
+
+            if (![k isKindOfClass:[NSString class]]) return NO;
+
+            if (!rb_plist_ok([d objectForKey:k])) return NO;
+
+        }
+
+        return YES;
+
+    }
+
+    return NO;
+
+}
+
+
+
+// 节点类键名：命中放行词，且不命中身份词。
+
+// 身份词必须狠 —— 一旦把 device_id / token / license 也恢复回去，
+
+// 服务端认得这台设备，额度就不会刷新，整条链白干。
+
+static BOOL rb_is_node_key(NSString *kk) {
+
+    NSString *low = [kk lowercaseString];
+
+    static const char *deny[] = {"device", "uuid", "token", "licen", "account",
+
+                                 "auth", "secret", "pass", "session", "phone",
+
+                                 "email", "sign", "cert", "key", "install",
+
+                                 "regist", "login", "pay", "order", "expire",
+
+                                 "time", "date", "count", "index", "used",
+
+                                 "quota", "traffic", "credit"};
+
+    for (unsigned i = 0; i < sizeof(deny) / sizeof(deny[0]); i++) {
+
+        if ([low rangeOfString:[NSString stringWithUTF8String:deny[i]]]
+
+                .location != NSNotFound) return NO;
+
+    }
+
+    static const char *allow[] = {"node", "server", "region", "country", "city",
+
+                                  "host", "address", "endpoint", "select",
+
+                                  "current", "last", "proxy", "vpn"};
+
+    for (unsigned i = 0; i < sizeof(allow) / sizeof(allow[0]); i++) {
+
+        if ([low rangeOfString:[NSString stringWithUTF8String:allow[i]]]
+
+                .location != NSNotFound) return YES;
+
+    }
+
+    return NO;
+
+}
+
+
+
+// 把三处 domain 的全部键名/值导出来，供下一步精确定位「当前节点」存哪
+
+static void rb_prefs_dump(void) {
+
+    @try {
+
+        NSMutableString *out = [NSMutableString string];
+
+        [out appendString:@"# rb-shim v64 配置键导出\n"];
+
+        [out appendString:@"# 行首带 * = 判定为「节点类」，抹除后会被恢复\n"];
+
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+
+        NSUserDefaults *gd = [[NSUserDefaults alloc] initWithSuiteName:RB_GROUP_ID];
+
+        int total = 0;
+
+        for (NSString *dom in rb_prefs_domains()) {
+
+            for (int which = 0; which < 2; which++) {
+
+                NSUserDefaults *src = (which == 0) ? ud : gd;
+
+                if (!src) continue;
+
+                NSDictionary *d = [src persistentDomainForName:dom];
+
+                if (!d || [d count] == 0) continue;
+
+                [out appendFormat:@"\n[domain %@ / %@] %lu 键\n", dom,
+
+                                  (which == 0 ? @"标准" : @"AppGroup"),
+
+                                  (unsigned long)[d count]];
+
+                for (NSString *k in d) {
+
+                    id v = [d objectForKey:k];
+
+                    NSString *sv = nil;
+
+                    if ([v isKindOfClass:[NSData class]])
+
+                        sv = [NSString stringWithFormat:@"<data %lu>",
+
+                              (unsigned long)[(NSData *)v length]];
+
+                    else if ([v isKindOfClass:[NSString class]]) sv = v;
+
+                    else sv = [v description];
+
+                    if ([sv length] > 240) sv = [sv substringToIndex:240];
+
+                    [out appendFormat:@"%@%@ = %@\n",
+
+                                      rb_is_node_key(k) ? @"*" : @" ", k, sv];
+
+                    total++;
+
+                }
+
+            }
+
+        }
+
+        [gd release];
+
+        NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Library"];
+
+        NSString *path = [dir stringByAppendingPathComponent:RB_PREFS_FILE];
+
+        [out writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+
+        rb_log("配置导出：Library/%s（%d 个键，%lu 字节，带 * 的会被保留）",
+
+               RB_PREFS_FILE, total, (unsigned long)[out length]);
+
+    } @catch (NSException *e) {
+
+        rb_log("配置导出失败：%s", [[e reason] UTF8String]);
+
+    }
+
+}
+
+
+
+// 抹之前：把节点类键抓进 rb_state.plist（抹除不删）
+
+static void rb_prefs_snapshot(void) {
+
+    @try {
+
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+
+        NSUserDefaults *gd = [[NSUserDefaults alloc] initWithSuiteName:RB_GROUP_ID];
+
+        NSMutableDictionary *all = [NSMutableDictionary dictionary];
+
+        int n = 0;
+
+        for (NSString *dom in rb_prefs_domains()) {
+
+            for (int which = 0; which < 2; which++) {
+
+                NSUserDefaults *src = (which == 0) ? ud : gd;
+
+                if (!src) continue;
+
+                NSDictionary *d = [src persistentDomainForName:dom];
+
+                if (!d || [d count] == 0) continue;
+
+                NSMutableDictionary *pick = [NSMutableDictionary dictionary];
+
+                for (NSString *k in d) {
+
+                    if (!rb_is_node_key(k)) continue;
+
+                    id v = [d objectForKey:k];
+
+                    if (!rb_plist_ok(v)) continue;
+
+                    [pick setObject:v forKey:k];
+
+                    n++;
+
+                }
+
+                if ([pick count])
+
+                    [all setObject:pick
+
+                            forKey:[NSString stringWithFormat:@"%@|%d", dom, which]];
+
+            }
+
+        }
+
+        [gd release];
+
+        if (n == 0) {
+
+            rb_log("节点保活：没找到节点类配置键（详见 Library/%s）", RB_PREFS_FILE);
+
+            return;
+
+        }
+
+        NSMutableDictionary *st = rb_state();
+
+        [st setObject:all forKey:RB_PREFS_SNAP_KEY];
+
+        rb_state_save(st);
+
+        rb_log("节点保活：已存 %d 个节点类配置键，抹完自动写回", n);
+
+    } @catch (NSException *e) {
+
+        rb_log("节点保活快照失败：%s", [[e reason] UTF8String]);
+
+    }
+
+}
+
+
+
+// 抹之后：把节点类键写回去（额度身份不恢复，刷新照旧）
+
+static void rb_prefs_restore(void) {
+
+    @try {
+
+        NSDictionary *all = [rb_state() objectForKey:RB_PREFS_SNAP_KEY];
+
+        if (![all isKindOfClass:[NSDictionary class]] || [all count] == 0) return;
+
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+
+        NSUserDefaults *gd = [[NSUserDefaults alloc] initWithSuiteName:RB_GROUP_ID];
+
+        int n = 0;
+
+        for (NSString *slot in all) {
+
+            NSDictionary *pick = [all objectForKey:slot];
+
+            if (![pick isKindOfClass:[NSDictionary class]]) continue;
+
+            NSArray *parts = [slot componentsSeparatedByString:@"|"];
+
+            if ([parts count] != 2) continue;
+
+            NSString *dom = [parts objectAtIndex:0];
+
+            NSUserDefaults *dst = ([[parts objectAtIndex:1] intValue] == 0) ? ud : gd;
+
+            if (!dst) continue;
+
+            NSMutableDictionary *cur =
+
+                [NSMutableDictionary dictionaryWithDictionary:
+
+                    ([dst persistentDomainForName:dom] ?: [NSDictionary dictionary])];
+
+            for (NSString *k in pick) [cur setObject:[pick objectForKey:k] forKey:k];
+
+            [dst setPersistentDomain:cur forName:dom];
+
+            n += (int)[pick count];
+
+        }
+
+        [ud synchronize];
+
+        if (gd) { [gd synchronize]; [gd release]; }
+
+        if (n) rb_log("节点保活：已写回 %d 个节点类配置键（身份键未恢复，额度照常刷新）", n);
+
+    } @catch (NSException *e) {
+
+        rb_log("节点保活恢复失败：%s", [[e reason] UTF8String]);
+
+    }
+
+}
+
+
+
 static int rb_wipe_all(void) {
 
     if (gWiping) return 0;
@@ -1301,7 +1666,7 @@ static int rb_wipe_all(void) {
 
 
 
-    NSArray *keepState = [NSArray arrayWithObjects:RB_STATE_FILE, nil];
+    NSArray *keepState = [NSArray arrayWithObjects:RB_STATE_FILE, RB_PREFS_FILE, nil];
 
     NSArray *keepDoc   = [NSArray arrayWithObjects:RB_LOG_NAME, nil];
 
@@ -1400,6 +1765,16 @@ static int rb_wipe_all(void) {
         }
 
     } @catch (NSException *e) { }
+
+
+
+    // v64：上面把 NSUserDefaults 全清了（连带 Flutter 记的「当前节点」），
+
+    // 这里立刻把节点类键写回去 —— 抹完的新进程就知道上次连的是哪个节点，
+
+    // 不用你手动点。身份键一个都不恢复，所以额度照样刷新。
+
+    rb_prefs_restore();
 
 
 
@@ -1956,6 +2331,310 @@ static void rb_export_nodes(void) {
         rb_log("节点导出失败：%s", [[e reason] UTF8String]);
     }
 }
+
+#pragma mark - 节点测速（v64）
+
+
+
+// 对节点 IP 做一次 TCP 握手，返回耗时（毫秒）；连不上返回 -1。
+
+// 这是「哪个节点最快」的第一手数据：同一台手机、同一个网络下量的。
+
+static double rb_tcp_rtt(const char *ip, int port) {
+
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+
+    if (fd < 0) return -1.0;
+
+
+
+    struct timeval tv;
+
+    tv.tv_sec = 2; tv.tv_usec = 0;
+
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+
+
+    struct sockaddr_in sa;
+
+    memset(&sa, 0, sizeof(sa));
+
+    sa.sin_family = AF_INET;
+
+    sa.sin_port = htons((unsigned short)port);
+
+    sa.sin_addr.s_addr = inet_addr(ip);
+
+
+
+    struct timeval t0, t1;
+
+    gettimeofday(&t0, NULL);
+
+    int r = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
+
+    gettimeofday(&t1, NULL);
+
+    close(fd);
+
+    if (r != 0) return -1.0;
+
+    return (double)(t1.tv_sec - t0.tv_sec) * 1000.0
+
+         + (double)(t1.tv_usec - t0.tv_usec) / 1000.0;
+
+}
+
+
+
+// 从抓到的服务端报文（Documents/rb-big/*.bin）里提节点 IP，量一遍延迟，
+
+// 排行写进 rb-nodes.txt + 日志。后台线程跑，最多 16 个 × 2 秒。
+
+static void rb_node_speedtest(void) {
+
+    @try {
+
+        NSString *bigDir = [NSHomeDirectory()
+
+                            stringByAppendingPathComponent:@"Documents/rb-big"];
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        NSArray *items = [fm contentsOfDirectoryAtPath:bigDir error:NULL];
+
+        if (!items || [items count] == 0) {
+
+            rb_log("节点测速：还没有抓到节点报文（rb-big 为空），跳过");
+
+            return;
+
+        }
+
+
+
+        NSMutableSet *ips = [NSMutableSet set];
+
+        NSRegularExpression *re =
+
+            [NSRegularExpression regularExpressionWithPattern:
+
+                @"(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})"
+
+                                                      options:0 error:NULL];
+
+        if (!re) return;
+
+        for (NSString *it in items) {
+
+            NSString *full = [bigDir stringByAppendingPathComponent:it];
+
+            NSData *d = [NSData dataWithContentsOfFile:full];
+
+            if (!d || [d length] == 0) continue;
+
+            NSString *s = rb_printable((const uint8_t *)[d bytes],
+
+                                       (size_t)([d length] > (1 << 20) ?
+
+                                                (1 << 20) : [d length]));
+
+            NSArray *ms = [re matchesInString:s options:0
+
+                                       range:NSMakeRange(0, [s length])];
+
+            for (NSTextCheckingResult *m in ms) {
+
+                @autoreleasepool {
+
+                    int o[4];
+
+                    BOOL ok = YES;
+
+                    for (int i = 0; i < 4; i++) {
+
+                        NSRange rg = [m rangeAtIndex:i + 1];
+
+                        NSString *p = [s substringWithRange:rg];
+
+                        o[i] = [p intValue];
+
+                        if (o[i] > 255) ok = NO;
+
+                    }
+
+                    if (!ok) continue;
+
+                    if (o[0] == 0 || o[0] == 10 || o[0] == 127 ||
+
+                        o[0] == 192 || o[0] == 172 || o[0] == 255) continue;
+
+                    [ips addObject:[NSString stringWithFormat:@"%d.%d.%d.%d",
+
+                                    o[0], o[1], o[2], o[3]]];
+
+                }
+
+            }
+
+            if ([ips count] >= 40) break;
+
+        }
+
+
+
+        NSArray *list = [[ips allObjects]
+
+                         sortedArrayUsingSelector:@selector(compare:)];
+
+        if ([list count] == 0) {
+
+            rb_log("节点测速：报文里没解析出节点 IP");
+
+            return;
+
+        }
+
+        NSArray *arr = ([list count] > 16)
+
+                     ? [list subarrayWithRange:NSMakeRange(0, 16)] : list;
+
+
+
+        rb_log("节点测速：对 %lu 个节点做 TCP 握手测延迟…",
+
+               (unsigned long)[arr count]);
+
+
+
+        dispatch_async(dispatch_get_global_queue(
+
+                           DISPATCH_QUEUE_PRIORITY_BACKGROUND, 0), ^{
+
+            @autoreleasepool {
+
+                NSMutableArray *res = [NSMutableArray array];
+
+                for (NSString *ip in arr) {
+
+                    double ms = rb_tcp_rtt([ip UTF8String], 443);
+
+                    [res addObject:[NSDictionary dictionaryWithObjectsAndKeys:
+
+                                    ip, @"ip",
+
+                                    [NSNumber numberWithDouble:ms], @"ms", nil]];
+
+                }
+
+                NSArray *srt = [res sortedArrayUsingComparator:
+
+                    ^NSComparisonResult(id a, id b) {
+
+                        double x = [[a objectForKey:@"ms"] doubleValue];
+
+                        double y = [[b objectForKey:@"ms"] doubleValue];
+
+                        if (x < 0) x = 1e9;
+
+                        if (y < 0) y = 1e9;
+
+                        if (x < y) return NSOrderedAscending;
+
+                        if (x > y) return NSOrderedDescending;
+
+                        return NSOrderedSame;
+
+                    }];
+
+
+
+                NSMutableString *out = [NSMutableString string];
+
+                [out appendString:@"\n[节点 TCP 延迟排行（越低越快）]\n"];
+
+                int i = 0;
+
+                NSMutableString *top = [NSMutableString string];
+
+                for (NSDictionary *r in srt) {
+
+                    double ms = [[r objectForKey:@"ms"] doubleValue];
+
+                    NSString *ip = [r objectForKey:@"ip"];
+
+                    i++;
+
+                    if (i <= 10) {
+
+                        if (ms < 0)
+
+                            [out appendFormat:@"%2d. %-16s 连不上\n", i,
+
+                                              [ip UTF8String]];
+
+                        else
+
+                            [out appendFormat:@"%2d. %-16s %6.0f ms\n", i,
+
+                                              [ip UTF8String], ms];
+
+                    }
+
+                    if (i <= 3 && ms >= 0)
+
+                        [top appendFormat:@"%@(%.0fms) ", ip, ms];
+
+                    if (i >= [srt count]) break;
+
+                }
+
+                NSString *path = [NSHomeDirectory()
+
+                    stringByAppendingPathComponent:@"Documents/rb-nodes.txt"];
+
+                NSString *old = [NSString stringWithContentsOfFile:path
+
+                                                         encoding:NSUTF8StringEncoding
+
+                                                            error:NULL];
+
+                NSMutableString *all = [NSMutableString string];
+
+                if (old) [all appendString:old];
+
+                [all appendString:out];
+
+                [all writeToFile:path atomically:YES
+
+                        encoding:NSUTF8StringEncoding error:NULL];
+
+
+
+                if ([top length])
+
+                    rb_log("节点测速完成，最快的三个：%s", [top UTF8String]);
+
+                else
+
+                    rb_log("节点测速完成：全部连不上（可能被网络挡了）");
+
+            }
+
+        });
+
+    } @catch (NSException *e) {
+
+        rb_log("节点测速失败：%s", [[e reason] UTF8String]);
+
+    }
+
+}
+
+
 
 static volatile int gSharedLogged = 0;
 static void rb_ne_sync_shared(void) {
@@ -3694,6 +4373,14 @@ static void rb_fire(const char *why, BOOL force) {
 
 
 
+    // v64：抹之前先把配置键导出 + 节点类键快照（同步做，不等异步回调）
+
+    rb_prefs_dump();
+
+    rb_prefs_snapshot();
+
+
+
     rb_log("额度归零（%s）：%.1f 秒后抹数据", why, (double)RB_DELAY_SEC);
 
 #if RB_STOP_BEFORE_WIPE
@@ -3831,13 +4518,9 @@ static uint64_t rb_cb_dispatch(int slot, uint64_t a0, uint64_t a1, uint64_t a2,
 
 
 #define RB_CB_T(n)                                                            \
-
 static uint64_t rb_cb_t##n(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3, \
-
                            uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) { \
-
     return rb_cb_dispatch(n, a0, a1, a2, a3, a4, a5, a6, a7);                 \
-
 }
 
 RB_CB_T(0) RB_CB_T(1) RB_CB_T(2) RB_CB_T(3)
@@ -3931,15 +4614,10 @@ static void rb_cb_wrap(uint64_t *v) {
 
 
 #define FWD(name, slot)                                                        \
-
 uint64_t name(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,              \
-
               uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {            \
-
     if (!slot) return (uint64_t)-1;                                            \
-
     return slot(a0, a1, a2, a3, a4, a5, a6, a7);                               \
-
 }
 
 
@@ -4326,7 +5004,7 @@ static void rb_panel_set_expanded(int on);   // 定义在 RbPanelVC 之后
 
     // —— 展开后的完整面板 ——
 
-    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 330, 262)];
+    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 330, 298)];
 
     v.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.94];
 
@@ -4469,6 +5147,24 @@ static void rb_panel_set_expanded(int on);   // 定义在 RbPanelVC 之后
     [b5 addTarget:self action:@selector(rbExport:) forControlEvents:UIControlEventTouchUpInside];
     [v addSubview:b5];
 
+    UIButton *b6 = [UIButton buttonWithType:UIButtonTypeSystem];
+    b6.frame = CGRectMake(12, 258, 150, 30);
+    b6.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1];
+    [b6 setTitle:@"节点测速" forState:UIControlStateNormal];
+    [b6 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b6.titleLabel.font = [UIFont systemFontOfSize:12];
+    [b6 addTarget:self action:@selector(rbSpeed:) forControlEvents:UIControlEventTouchUpInside];
+    [v addSubview:b6];
+
+    UIButton *b7 = [UIButton buttonWithType:UIButtonTypeSystem];
+    b7.frame = CGRectMake(168, 258, 150, 30);
+    b7.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1];
+    [b7 setTitle:@"导出配置键" forState:UIControlStateNormal];
+    [b7 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b7.titleLabel.font = [UIFont systemFontOfSize:12];
+    [b7 addTarget:self action:@selector(rbPrefs:) forControlEvents:UIControlEventTouchUpInside];
+    [v addSubview:b7];
+
 
 
     v.hidden = YES;      // 默认收起成球
@@ -4479,6 +5175,8 @@ static void rb_panel_set_expanded(int on);   // 定义在 RbPanelVC 之后
 
 - (void)rbWipe:(id)sender    { (void)sender; rb_wipe_now(); }
 - (void)rbExport:(id)sender  { (void)sender; rb_export_nodes(); }
+- (void)rbSpeed:(id)sender   { (void)sender; rb_node_speedtest(); }
+- (void)rbPrefs:(id)sender   { (void)sender; rb_prefs_dump(); }
 
 - (void)rbRefresh:(id)sender { (void)sender; rb_panel_refresh(); }
 
@@ -4556,7 +5254,7 @@ static void rb_panel_set_expanded(int on) {
 
         if (on) {
 
-            fr = CGRectMake(8, top, wdt, 226);
+            fr = CGRectMake(8, top, wdt, 298);
 
         } else {
 
@@ -5069,7 +5767,12 @@ static void rb_init(void) {
         if (rb_auto_on()) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            @autoreleasepool { rb_export_nodes(); }
+            @autoreleasepool { rb_export_nodes(); rb_prefs_dump(); rb_prefs_restore(); }
+        });
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(28 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @autoreleasepool { rb_node_speedtest(); }
         });
 
             // 开着常连：进来就保证隧道是连着的（on-demand 装在 4 秒后，start 在 6 秒后）
