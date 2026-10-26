@@ -1494,7 +1494,7 @@ static void rb_prefs_dump(void) {
 
         rb_log("配置导出：Library/%s（%d 个键，%lu 字节，带 * 的会被保留）",
 
-               RB_PREFS_FILE, total, (unsigned long)[out length]);
+               [RB_PREFS_FILE UTF8String], total, (unsigned long)[out length]);
 
     } @catch (NSException *e) {
 
@@ -1562,7 +1562,7 @@ static void rb_prefs_snapshot(void) {
 
         if (n == 0) {
 
-            rb_log("节点保活：没找到节点类配置键（详见 Library/%s）", RB_PREFS_FILE);
+            rb_log("节点保活：没找到节点类配置键（详见 Library/%s）", [RB_PREFS_FILE UTF8String]);
 
             return;
 
