@@ -156,11 +156,14 @@
 
 #define RB_FLOW_TICK_SEC    5.0                    // 采样间隔（秒）
 
-#define RB_FLOW_MAX_STEP    (64LL * 1024 * 1024)   // 一个采样周期最多可能跑这么多；
+#define RB_FLOW_MAX_STEP    (1024LL * 1024 * 1024)   // 一个采样周期最多可能跑这么多；
 
-                                                   // 超了就是接口集合变了（别的 utun 加入/消失），
-
-                                                   // 这种跳变不算流量，否则累计会突然爆表
+                                                   // v65：原来是 64MB，实测速率 11812 KB/s 时
+                                                   // 一个 5 秒周期就跑 69MB，被当成「接口变化」
+                                                   // 掉弃 → 累计不涨、流量时间戳不更新 →
+                                                   // 看门狗反过来把**正在跑的隧道**判成假连接
+                                                   // 停掉（v64 日志 98/120 行）。改成 1GB：
+                                                   // 真接口变化是「读数倒退」，走下面那个分支。
 
 // v61：限速判据。300MB 用完的硬特征是掉到福利速度（160Kbps ≈ 20KB/s），
 
@@ -204,6 +207,16 @@
 #define RB_PREFS_SNAP_KEY  @"prefsSnap"
 
 #define RB_PREFS_FILE      @"rb-prefs.txt"
+
+// v65：**「当前节点」根本不在 NSUserDefaults，也不在 providerConfiguration
+// （那里面只有 1 个键）。它在
+//   Library/Application Support/RelyVPN/currentNodeWithReason.bin
+// （315 字节明文：IP + 城市 + 节点名 + 国家 + 节点 UUID + 认证串 + 域名）。
+// 抹数据时整个 Application Support 被 rb_clean_deep 扫掉 → 新进程不认识任何节点
+// → 自动重连拉起空壳隧道 → 卡「正在连接」转圈 → 只能手动点节点。
+// 这个文件里只有节点凭据、没有设备身份，保住它不影响额度刷新。
+
+#define RB_NODEFILES_KEY   @"nodeFiles"
 
 
 
@@ -645,6 +658,21 @@ static BOOL rb_pb_dead(const uint8_t *b, size_t n, int depth, size_t *budget);
 
 
 
+// v65：服务端每次都会把额度报给我们（len=253 那种包里就是 total/used）。
+// 记下来给面板显示用 —— 自己数 utun 字节是漏的：隧道每次重建 utun 从 0 起算，
+// 重建前最后一段（最多 5 秒 × 11MB/s）全丢了，4 分钟就能少算 27MB。
+// 截图里 App 已显示「体验套餐·已用尽」、面板还剩 27.2，就是漏算漏出来的。
+
+static volatile uint64_t gSrvTotal = 0;   // 服务端报的总额度（字节）
+
+static volatile uint64_t gSrvUsed  = 0;   // 服务端报的已用（字节）
+
+static volatile double   gSrvTs    = 0;   // 上次收到额度报文的时刻
+
+static uint64_t rb_pb_prev_used = 0;      // 去重打日志用
+
+
+
 static BOOL rb_pb_dead(const uint8_t *b, size_t n, int depth, size_t *budget) {
 
     if (depth > 6 || n < 2) return NO;
@@ -747,16 +775,33 @@ static BOOL rb_pb_dead(const uint8_t *b, size_t n, int depth, size_t *budget) {
 
     }
 
-    if (hasF2 && hasF3 && f2 >= (uint64_t)RB_MIN_QUOTA &&
+    if (hasF2 && hasF3 &&
+
+        f2 >= (uint64_t)RB_MIN_QUOTA &&
 
         (f2 % (1024 * 1024)) == 0 &&                       // 额度是整 MB，时间戳不是
 
         f2 <= (uint64_t)RB_MAX_QUOTA &&
-        f3 >= (uint64_t)((double)f2 * RB_WIPE_THRESHOLD) &&
 
         f3 <= f2 + f2 / 20) {                              // used 不会远超 quota
 
-        return YES;
+        // v65：只要像额度就记 —— 面板剩余量用它，不再自己数 utun 字节
+        gSrvTotal = f2;
+
+        gSrvUsed  = f3;
+
+        gSrvTs    = rb_now();
+
+        if (f3 > rb_pb_prev_used + (1ULL << 20) ||
+            f3 + (1ULL << 20) < rb_pb_prev_used ||
+            rb_pb_prev_used == 0) {
+            rb_pb_prev_used = f3;
+            rb_log("服务端额度：共 %.1f MB，已用 %.1f MB，剩 %.1f MB",
+                   (double)f2 / 1048576.0, (double)f3 / 1048576.0,
+                   (double)(f2 - f3) / 1048576.0);
+        }
+
+        if (f3 >= (uint64_t)((double)f2 * RB_WIPE_THRESHOLD)) return YES;
 
     }
 
@@ -1648,6 +1693,192 @@ static void rb_prefs_restore(void) {
 
 
 
+#pragma mark - 节点文件保活（v65）
+
+
+
+static NSString *rb_node_dir(void) {
+
+    return [[[NSHomeDirectory() stringByAppendingPathComponent:@"Library"]
+
+             stringByAppendingPathComponent:@"Application Support"]
+
+             stringByAppendingPathComponent:@"RelyVPN"];
+
+}
+
+
+
+// 文件名判定：命中节点词、不命中身份词
+
+static BOOL rb_is_node_file(NSString *name) {
+
+    NSString *low = [name lowercaseString];
+
+    static const char *deny[] = {"device", "uuid", "token", "licen", "account",
+
+                                 "auth", "secret", "pass", "session", "key",
+
+                                 "user", "phone", "email", "order", "pay"};
+
+    for (unsigned i = 0; i < sizeof(deny) / sizeof(deny[0]); i++) {
+
+        if ([low rangeOfString:[NSString stringWithUTF8String:deny[i]]]
+
+                .location != NSNotFound) return NO;
+
+    }
+
+    static const char *allow[] = {"node", "server", "region", "country", "city",
+
+                                  "select", "current", "proxy"};
+
+    for (unsigned i = 0; i < sizeof(allow) / sizeof(allow[0]); i++) {
+
+        if ([low rangeOfString:[NSString stringWithUTF8String:allow[i]]]
+
+                .location != NSNotFound) return YES;
+
+    }
+
+    return NO;
+
+}
+
+
+
+// 抹之前：把节点类文件整份读进 rb_state.plist（抹除不删）
+
+static void rb_node_files_snapshot(void) {
+
+    @try {
+
+        NSString *dir = rb_node_dir();
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        NSArray *items = [fm subpathsOfDirectoryAtPath:dir error:NULL];
+
+        if (!items || [items count] == 0) {
+
+            rb_log("节点文件保活：Application Support/RelyVPN 下没有文件");
+
+            return;
+
+        }
+
+        NSMutableDictionary *pick = [NSMutableDictionary dictionary];
+
+        int n = 0;
+
+        for (NSString *it in items) {
+
+            if (!rb_is_node_file(it)) continue;
+
+            NSString *full = [dir stringByAppendingPathComponent:it];
+
+            BOOL isDir = NO;
+
+            if (![fm fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+
+            NSDictionary *a = [fm attributesOfItemAtPath:full error:NULL];
+
+            unsigned long long sz = a ? [a fileSize] : 0;
+
+            if (sz == 0 || sz > (256ULL * 1024)) continue;
+
+            NSData *d = [NSData dataWithContentsOfFile:full];
+
+            if (!d || [d length] == 0) continue;
+
+            [pick setObject:d forKey:it];
+
+            n++;
+
+        }
+
+        if (n == 0) {
+
+            rb_log("节点文件保活：%lu 个文件里没有节点类的（详见 Documents/rb-nodes.txt）",
+
+                   (unsigned long)[items count]);
+
+            return;
+
+        }
+
+        NSMutableDictionary *st = rb_state();
+
+        [st setObject:pick forKey:RB_NODEFILES_KEY];
+
+        rb_state_save(st);
+
+        NSString *names = [[pick allKeys] componentsJoinedByString:@", "];
+
+        if ([names length] > 200) names = [names substringToIndex:200];
+
+        rb_log("节点文件保活：已存 %d 个节点文件 [%s]，抹完原样写回",
+
+               n, [names UTF8String]);
+
+    } @catch (NSException *e) {
+
+        rb_log("节点文件保活快照失败：%s", [[e reason] UTF8String]);
+
+    }
+
+}
+
+
+
+// 抹之后：目录被删了，重建并把节点文件写回去
+
+static void rb_node_files_restore(void) {
+
+    @try {
+
+        NSDictionary *pick = [rb_state() objectForKey:RB_NODEFILES_KEY];
+
+        if (![pick isKindOfClass:[NSDictionary class]] || [pick count] == 0) return;
+
+        NSString *dir = rb_node_dir();
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        [fm createDirectoryAtPath:dir
+
+             withIntermediateDirectories:YES attributes:nil error:NULL];
+
+        int n = 0;
+
+        for (NSString *it in pick) {
+
+            NSData *d = [pick objectForKey:it];
+
+            if (![d isKindOfClass:[NSData class]] || [d length] == 0) continue;
+
+            NSString *full = [dir stringByAppendingPathComponent:it];
+
+            [fm createDirectoryAtPath:[full stringByDeletingLastPathComponent]
+
+                 withIntermediateDirectories:YES attributes:nil error:NULL];
+
+            if ([d writeToFile:full atomically:YES]) n++;
+
+        }
+
+        if (n) rb_log("节点文件保活：已写回 %d 个节点文件（身份文件未动，额度照常刷新）", n);
+
+    } @catch (NSException *e) {
+
+        rb_log("节点文件保活恢复失败：%s", [[e reason] UTF8String]);
+
+    }
+
+}
+
+
+
 static int rb_wipe_all(void) {
 
     if (gWiping) return 0;
@@ -1776,6 +2007,8 @@ static int rb_wipe_all(void) {
 
     rb_prefs_restore();
 
+    rb_node_files_restore();
+
 
 
     rb_log("抹数据完成：删掉 %d 个文件/目录，keychain %d 项，耗时 %.2fs",
@@ -1878,7 +2111,72 @@ static void rb_auto_start_vpn(int attempt);
 
 //              4 reasserting / 5 disconnecting
 
+// v65：NEVPNManager.sharedManager 对这个 App 恒报 0（v62/v64 日志反复出现
+// 「隧道状态 0，拉起一次」紧接着「配置自带状态 3，不动」）—— 两个判据自相矛盾，
+// 结果看门狗每轮都白跑一次 start，而且**永远走不到 rb_bg_renew()**，
+// 后台时间一次都没续过。改成扫真实的 NETunnelProviderManager 配置为准。
+
+static volatile int    gRealStatus = -1;
+
+static volatile double gRealStatusTs = 0;
+
+
+
+static void rb_status_probe(void) {
+
+    @try {
+
+        Class C = objc_getClass("NETunnelProviderManager");
+
+        if (!C) return;
+
+        void (^h)(NSArray *, NSError *) = ^(NSArray *mans, NSError *err) {
+
+            (void)err;
+
+            int best = -1;
+
+            for (id m in mans) {
+
+                if (![m respondsToSelector:@selector(connection)]) continue;
+
+                id conn = ((id (*)(id, SEL))objc_msgSend)(
+
+                    m, sel_registerName("connection"));
+
+                if (!conn || ![conn respondsToSelector:@selector(status)]) continue;
+
+                int s = (int)((NSInteger (*)(id, SEL))objc_msgSend)(
+
+                    conn, sel_registerName("status"));
+
+                if (s > best) best = s;
+
+            }
+
+            if (best >= 0) { gRealStatus = best; gRealStatusTs = rb_now(); }
+
+        };
+
+        ((void (*)(id, SEL, id))objc_msgSend)(
+
+            C, sel_registerName("loadAllFromPreferencesWithCompletionHandler:"), h);
+
+    } @catch (NSException *e) { }
+
+}
+
+
+
 static int rb_vpn_status(void) {
+
+    double age = rb_now() - gRealStatusTs;
+
+    if (age > 4.0) rb_status_probe();          // 异步刷新，不阻塞
+
+    if (gRealStatus >= 0 && age < 60.0) return gRealStatus;
+
+
 
     @try {
 
@@ -2288,7 +2586,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v63 节点导出\n"];
+        [out appendString:@"# rb-shim v65 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -2398,17 +2696,41 @@ static void rb_node_speedtest(void) {
 
     @try {
 
+        // v65：rb-big 经常是空的（本次就没抓到 >32KB 的报文），真正的节点在
+        // Library/Application Support/RelyVPN/currentNodeWithReason.bin 里。
+        // 两个目录一起扫，哪个有就用哪个。
+
         NSString *bigDir = [NSHomeDirectory()
 
                             stringByAppendingPathComponent:@"Documents/rb-big"];
 
         NSFileManager *fm = [NSFileManager defaultManager];
 
-        NSArray *items = [fm contentsOfDirectoryAtPath:bigDir error:NULL];
+        NSMutableArray *files = [NSMutableArray array];
 
-        if (!items || [items count] == 0) {
+        NSArray *a1 = [fm contentsOfDirectoryAtPath:bigDir error:NULL];
 
-            rb_log("节点测速：还没有抓到节点报文（rb-big 为空），跳过");
+        if (a1) for (NSString *it in a1)
+
+            [files addObject:[bigDir stringByAppendingPathComponent:it]];
+
+        NSArray *a2 = [fm subpathsOfDirectoryAtPath:rb_node_dir() error:NULL];
+
+        if (a2) for (NSString *it in a2) {
+
+            NSString *low = [it lowercaseString];
+
+            if ([low hasSuffix:@".bin"] || [low hasSuffix:@".json"] ||
+
+                [low hasSuffix:@".txt"] || [low hasSuffix:@".dat"])
+
+                [files addObject:[rb_node_dir() stringByAppendingPathComponent:it]];
+
+        }
+
+        if ([files count] == 0) {
+
+            rb_log("节点测速：还没抓到节点报文（rb-big 与节点目录都为空），跳过");
 
             return;
 
@@ -2428,9 +2750,7 @@ static void rb_node_speedtest(void) {
 
         if (!re) return;
 
-        for (NSString *it in items) {
-
-            NSString *full = [bigDir stringByAppendingPathComponent:it];
+        for (NSString *full in files) {
 
             NSData *d = [NSData dataWithContentsOfFile:full];
 
@@ -3583,11 +3903,20 @@ static void rb_flow_tick(void) {
 
             if (lastTs > 0)
 
-                rb_log("状态：utun 累计 %.1f / %.0f MB，速率 %.1f KB/s，低速 %.0f 秒，"
+                rb_log("状态：额度 %s %.1f / %.0f MB（剩 %.1f），utun 计 %.1f MB，"
+                       "速率 %.1f KB/s，低速 %.0f 秒，"
 
                        "归零命中 %d 次，已抹除 %d 次，距上次抹除 %.0f 秒（重建 %d 次）",
 
-                       acc / 1048576.0, rb_quota_limit() / 1048576.0, gRateKBps,
+                       (gSrvTotal > 0) ? "服务端" : "本地",
+                       (gSrvTotal > 0) ? (double)gSrvUsed / 1048576.0
+                                       : (double)acc / 1048576.0,
+                       (gSrvTotal > 0) ? (double)gSrvTotal / 1048576.0
+                                       : (double)rb_quota_limit() / 1048576.0,
+                       (gSrvTotal > 0)
+                           ? (double)(gSrvTotal - gSrvUsed) / 1048576.0
+                           : (double)(rb_quota_limit() - acc) / 1048576.0,
+                       acc / 1048576.0, gRateKBps,
 
                        gSlowSec, gHits,
 
@@ -3597,11 +3926,20 @@ static void rb_flow_tick(void) {
 
             else
 
-                rb_log("状态：utun 累计 %.1f / %.0f MB，速率 %.1f KB/s，低速 %.0f 秒，"
+                rb_log("状态：额度 %s %.1f / %.0f MB（剩 %.1f），utun 计 %.1f MB，"
+                       "速率 %.1f KB/s，低速 %.0f 秒，"
 
                        "归零命中 %d 次，已抹除 %d 次（从未抹除）（重建 %d 次）",
 
-                       acc / 1048576.0, rb_quota_limit() / 1048576.0, gRateKBps,
+                       (gSrvTotal > 0) ? "服务端" : "本地",
+                       (gSrvTotal > 0) ? (double)gSrvUsed / 1048576.0
+                                       : (double)acc / 1048576.0,
+                       (gSrvTotal > 0) ? (double)gSrvTotal / 1048576.0
+                                       : (double)rb_quota_limit() / 1048576.0,
+                       (gSrvTotal > 0)
+                           ? (double)(gSrvTotal - gSrvUsed) / 1048576.0
+                           : (double)(rb_quota_limit() - acc) / 1048576.0,
+                       acc / 1048576.0, gRateKBps,
 
                        gSlowSec, gHits,
 
@@ -3674,6 +4012,25 @@ static void rb_flow_tick(void) {
                    acc / 1048576.0, rb_quota_limit() / 1048576.0);
 
             rb_fire("流量判据", NO);
+
+            return;
+
+        }
+
+        // v65：服务端报的数才是权威 —— 它说用完了就是用完了，
+        // 本地 utun 计数只是漏得多的近似，别让它抢在前面或拖后腿。
+        if (gSrvTotal > 0 &&
+
+            (uint64_t)((double)gSrvUsed / (double)gSrvTotal * 100.0) >=
+            (uint64_t)(RB_WIPE_THRESHOLD * 100.0)) {
+
+            rb_log("服务端额度用完：已用 %.1f / %.1f MB，触发抹除",
+
+                   (double)gSrvUsed / 1048576.0,
+
+                   (double)gSrvTotal / 1048576.0);
+
+            rb_fire("服务端额度判据", NO);
 
             return;
 
@@ -4283,6 +4640,13 @@ static void rb_fire(const char *why, BOOL force) {
 
     gFlowAcc = 0;
 
+    // v65：抹完 = 新账号 = 新额度，旧的服务端报数作废，等下一条报文再记
+    gSrvTotal = 0;
+
+    gSrvUsed  = 0;
+
+    gSrvTs    = 0;
+
     gSlowSec = 0;          // v61：抹完限速判据重新武装
 
     gThrottleHit = 0;
@@ -4378,6 +4742,8 @@ static void rb_fire(const char *why, BOOL force) {
     rb_prefs_dump();
 
     rb_prefs_snapshot();
+
+    rb_node_files_snapshot();
 
 
 
@@ -4842,7 +5208,11 @@ static NSString *rb_status_text(void) {
 
     NSString *why = gLastWhy ? gLastWhy : @"尚未触发";
 
-    double left = (double)rb_quota_limit() - (double)gFlowAcc;
+    double left = (gSrvTotal > 0)
+
+                ? (double)(gSrvTotal - gSrvUsed)          // 服务端报的，准
+
+                : (double)rb_quota_limit() - (double)gFlowAcc;
 
     if (left < 0) left = 0;
 
@@ -4864,9 +5234,9 @@ static NSString *rb_status_text(void) {
 
     return [NSString stringWithFormat:
 
-        @"RelyVPN 自动抹数据 v63\n"
+        @"RelyVPN 自动抹数据 v65\n"
 
-        @"VPN 流量 %.1f / %.0f MB（还剩 %.1f）\n"
+        @"额度 %.1f / %.0f MB（还剩 %.1f）%@\n"
 
         @"隧道状态：%@%@   速率 %@\n"
 
@@ -4878,9 +5248,14 @@ static NSString *rb_status_text(void) {
 
         @"日志：文件 App → RelyVPN → %@",
 
-        (double)gFlowAcc / 1048576.0, (double)rb_quota_limit() / 1048576.0,
+        (gSrvTotal > 0) ? (double)gSrvUsed / 1048576.0
+                        : (double)gFlowAcc / 1048576.0,
+        (gSrvTotal > 0) ? (double)gSrvTotal / 1048576.0
+                        : (double)rb_quota_limit() / 1048576.0,
 
-        left / 1048576.0, vsName, gFastLane ? @"（快速通道）" : @"", rate,
+        left / 1048576.0,
+        (gSrvTotal > 0) ? @"［服务端］" : @"［本地计数］",
+        vsName, gFastLane ? @"（快速通道）" : @"", rate,
 
         cnt, gHits, when, why, RB_LOG_NAME];
 
@@ -4912,7 +5287,11 @@ static NSString *rb_bubble_text(void) {
 
     int vs = rb_vpn_status();
 
-    double left = (double)rb_quota_limit() - (double)gFlowAcc;
+    double left = (gSrvTotal > 0)
+
+                ? (double)(gSrvTotal - gSrvUsed)          // 服务端报的，准
+
+                : (double)rb_quota_limit() - (double)gFlowAcc;
 
     if (left < 0) left = 0;
 
@@ -5606,13 +5985,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v63 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v65 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v63 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v65 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
@@ -5767,7 +6146,8 @@ static void rb_init(void) {
         if (rb_auto_on()) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            @autoreleasepool { rb_export_nodes(); rb_prefs_dump(); rb_prefs_restore(); }
+            @autoreleasepool { rb_node_files_restore(); rb_prefs_restore();
+                               rb_prefs_dump(); rb_export_nodes(); }
         });
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(28 * NSEC_PER_SEC)),
