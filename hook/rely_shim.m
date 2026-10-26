@@ -218,6 +218,22 @@
 
 #define RB_NODEFILES_KEY   @"nodeFiles"
 
+// ---- v67：抹除后用新节点 ----
+// currentNodeWithReason.bin 里除了 IP/城市/名字，还带着一串服务端签发的「节点认证串」，
+// 那串是绑账号/设备的。抹完数据换来新身份，却把旧认证串写回去连同一个节点 ——
+// 服务端按旧账号记账，直接压成福利限速（v66 日志：抹后 82 秒只跑 0.7MB、10.8 KB/s，
+// 正常是 8000+ KB/s）。所以抹完之后要「查一遍速率」，被限速就把旧节点丢掉，
+// 让 App 用新身份重新申请节点。
+#define RB_NODE_ROTATE_ON    1          // 1=开（0=关，退回v66行为）
+#define RB_NODE_LIMIT_KBPS   500.0      // 抹后持续低于这个速率（KB/s）判为节点被限速
+#define RB_NODE_OBS_SEC      20.0       // 观测窗口：连着这么久都低速才动手
+#define RB_NODE_OBS_ARM_SEC  8.0        // 抹完前这些秒不算（隧道在握手、本来就没速度）
+#define RB_NODE_OK_MB        3.0        // 抹后跑出这么多 MB 就说明没限速，观测结束
+#define RB_NODE_WAIT_SEC     180.0      // 抹除后这么久内才做这个检测
+#define RB_NODE_ROTATE_MAX   3          // 一次抹除周期最多丢几次节点
+#define RB_NODE_WATCH_SEC    4.0        // 丢了之后每隔多久看一眼 App 有没有选出新节点
+#define RB_NODE_WATCH_MAX    40         // 最多看这么多次（40 x 4 秒 = 160 秒）
+
 
 
 // 时间兜底：RB_FALLBACK_ON=1 时，距上次抹除超过 RB_WIPE_MAX_HOURS 小时就抹一次。
@@ -1058,6 +1074,10 @@ static void rb_set_ondemand(BOOL on);
 // force=1 表示「用户点了按钮」，此时即使自动连接开关是关的也要拉一次
 
 static void rb_start_vpn_once(int force);
+
+static void rb_node_rotate(void);
+
+static void rb_node_watch_new(int left);
 
 static void rb_panel_refresh(void);
 
@@ -1999,6 +2019,121 @@ static void rb_node_files_restore(void) {
 
 
 
+// v67：丢掉旧节点文件和保活快照 —— App 下次要连就会以新身份重新申请节点凭据。
+// 快照也必须一起清，不然下一次 boot/卡连接兜底又会把它写回来，白丢一次。
+static void rb_node_rotate(void) {
+
+    @try {
+
+        NSString *dir = rb_node_dir();
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        int n = 0;
+
+        for (NSString *it in ([fm contentsOfDirectoryAtPath:dir error:NULL] ?: @[])) {
+
+            if (!rb_is_node_file(it)) continue;
+
+            if ([fm removeItemAtPath:[dir stringByAppendingPathComponent:it]
+
+                               error:NULL]) n++;
+
+        }
+
+        NSMutableDictionary *st = rb_state();
+
+        [st removeObjectForKey:RB_NODEFILES_KEY];
+
+        [st removeObjectForKey:RB_PREFS_SNAP_KEY];
+
+        rb_state_save(st);
+
+        rb_log("换节点：删掉 %d 个旧节点文件、清掉保活快照 —— "
+               "App 下次连接会用新身份重新申请节点凭据（旧认证串是限速根因）", n);
+
+        rb_stop_vpn();
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(RB_STOP_SETTLE_SEC * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+
+            @autoreleasepool { rb_start_vpn_once(0); }
+
+        });
+
+        rb_node_watch_new(RB_NODE_WATCH_MAX);
+
+    } @catch (NSException *e) {
+
+        rb_log("换节点失败：%s", [[e reason] UTF8String]);
+
+    }
+
+}
+
+
+
+// App 只有在你选了节点之后才会重写 currentNodeWithReason.bin。盯着这个文件：
+// 一出现（说明选好了）就立刻拉起隧道，不用再回到 App 里点连接。
+static void rb_node_watch_new(int left) {
+
+    if (left <= 0) return;
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(RB_NODE_WATCH_SEC * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+
+        @autoreleasepool {
+
+            NSString *f = [rb_node_dir()
+
+                           stringByAppendingPathComponent:@"currentNodeWithReason.bin"];
+
+            NSDictionary *a = [[NSFileManager defaultManager]
+
+                               attributesOfItemAtPath:f error:NULL];
+
+            if (a && [a fileSize] > 0) {
+
+                rb_log("检测到 App 已选中新节点（%lu 字节），立刻拉起隧道",
+
+                       (unsigned long)[a fileSize]);
+
+                // 顺带把它存成快照，往后抹数据还能再救一次
+
+                NSMutableDictionary *st = rb_state();
+
+                NSMutableDictionary *pick =
+
+                    [[[st objectForKey:RB_NODEFILES_KEY] mutableCopy] ?:
+
+                     [NSMutableDictionary dictionary] autorelease];
+
+                NSData *d = [NSData dataWithContentsOfFile:f];
+
+                if (d) [pick setObject:d forKey:@"currentNodeWithReason.bin"];
+
+                [st setObject:pick forKey:RB_NODEFILES_KEY];
+
+                rb_state_save(st);
+
+                rb_start_vpn_once(1);
+
+                return;
+
+            }
+
+            rb_node_watch_new(left - 1);
+
+        }
+
+    });
+
+}
+
+
+
 static int rb_wipe_all(void) {
 
     if (gWiping) return 0;
@@ -2706,7 +2841,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v66 节点导出\n"];
+        [out appendString:@"# rb-shim v67 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -4021,6 +4156,66 @@ static void rb_flow_tick(void) {
         lastAcc = acc;
 
         lastTs  = now;
+
+#endif
+
+#if RB_NODE_ROTATE_ON
+
+        // v67：抹除之后的节点体检。抹完 8 秒起算，连着 20 秒速率都上不去（<500 KB/s）
+        // 就判定「连的是旧节点/旧身份」→ 丢掉节点让 App 重新申请。
+        // 一旦真跑出 3MB 以上流量就说明没限速，观测结束不再打扰。
+        {
+            double lw = [[st objectForKey:@"lastWipeTs"] doubleValue];
+            static int rotN = 0, armed = 0;
+            static double obsStart = 0;
+
+            if (lw <= 0 || now - lw > RB_NODE_WAIT_SEC) { rotN = 0; armed = 0; obsStart = 0; }
+
+            else if (armed >= 0) {
+
+                double accMB = (double)acc / 1048576.0;
+
+                if (accMB >= RB_NODE_OK_MB) {
+
+                    rb_log("节点体检：抹后已跑 %.1f MB，速率 %.1f KB/s —— 当前节点没被限速",
+                           accMB, gRateKBps);
+                    armed = -1;
+
+                } else if (now - lw > RB_NODE_OBS_ARM_SEC) {
+
+                    if (obsStart <= 0) obsStart = now;
+
+                    if (now - obsStart >= RB_NODE_OBS_SEC &&
+                        gRateKBps >= 0 && gRateKBps < RB_NODE_LIMIT_KBPS) {
+
+                        if (rotN < RB_NODE_ROTATE_MAX) {
+
+                            rotN++;
+
+                            rb_log("节点体检：抹后 %.0f 秒速率只有 %.1f KB/s（正常 8000+）——"
+                                   "判定旧节点的旧认证串被限速，丢掉换新的（第 %d/%d 次）",
+                                   now - lw, gRateKBps, rotN, RB_NODE_ROTATE_MAX);
+
+                            rb_node_rotate();
+
+                            obsStart = now;
+
+                        } else {
+
+                            armed = -1;
+
+                            rb_log("节点体检：连换 %d 次仍然限速 —— 剩下的要在 App 里手选一个新节点"
+                                   "（选中后 shim 会自动拉隧道）", RB_NODE_ROTATE_MAX);
+
+                        }
+
+                    }
+
+                }
+
+            }
+
+        }
 
 #endif
 
@@ -5518,7 +5713,7 @@ static void rb_panel_set_expanded(int on);   // 定义在 RbPanelVC 之后
 
     // —— 展开后的完整面板 ——
 
-    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 330, 298)];
+    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 330, 334)];
 
     v.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.94];
 
@@ -5677,7 +5872,17 @@ static void rb_panel_set_expanded(int on);   // 定义在 RbPanelVC 之后
     [b7 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     b7.titleLabel.font = [UIFont systemFontOfSize:12];
     [b7 addTarget:self action:@selector(rbPrefs:) forControlEvents:UIControlEventTouchUpInside];
+
     [v addSubview:b7];
+
+    UIButton *b8 = [UIButton buttonWithType:UIButtonTypeSystem];
+    b8.frame = CGRectMake(12, 294, 306, 30);
+    b8.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1];
+    [b8 setTitle:@"换节点（丢旧节点重申请）" forState:UIControlStateNormal];
+    [b8 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b8.titleLabel.font = [UIFont systemFontOfSize:12];
+    [b8 addTarget:self action:@selector(rbNodeRot:) forControlEvents:UIControlEventTouchUpInside];
+    [v addSubview:b8];
 
 
 
@@ -5691,6 +5896,8 @@ static void rb_panel_set_expanded(int on);   // 定义在 RbPanelVC 之后
 - (void)rbExport:(id)sender  { (void)sender; rb_export_nodes(); }
 - (void)rbSpeed:(id)sender   { (void)sender; rb_node_speedtest(); }
 - (void)rbPrefs:(id)sender   { (void)sender; rb_prefs_dump(); }
+
+- (void)rbNodeRot:(id)sender { (void)sender; rb_node_rotate(); }
 
 - (void)rbRefresh:(id)sender { (void)sender; rb_panel_refresh(); }
 
@@ -5768,7 +5975,7 @@ static void rb_panel_set_expanded(int on) {
 
         if (on) {
 
-            fr = CGRectMake(8, top, wdt, 298);
+            fr = CGRectMake(8, top, wdt, 334);
 
         } else {
 
@@ -6127,13 +6334,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v66 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v67 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v66 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v67 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
