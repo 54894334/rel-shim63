@@ -406,6 +406,48 @@ static void rb_report_merge(void) {
 
             [NSDate date]];
 
+        // v80：把自愈阶梯的结论单独提到最前面 —— 一眼就能看到「第几级有效」，
+        // 不用在几千行日志里翻。
+        @try {
+
+            NSString *lg = [NSString stringWithContentsOfFile:
+                            [doc stringByAppendingPathComponent:@"rb-shim.log"]
+
+                                                  encoding:NSUTF8StringEncoding
+                                                     error:NULL];
+
+            if (lg) {
+
+                NSMutableString *hl = [NSMutableString string];
+
+                [lg enumerateLinesUsingBlock:^(NSString *line, BOOL *stop) {
+
+                    (void)stop;
+
+                    if ([line rangeOfString:@"[HEAL]"].location != NSNotFound ||
+
+                        [line rangeOfString:@"[H1]"].location != NSNotFound ||
+
+                        [line rangeOfString:@"[H2]"].location != NSNotFound ||
+
+                        [line rangeOfString:@"[H3]"].location != NSNotFound ||
+
+                        [line rangeOfString:@"[H4]"].location != NSNotFound ||
+
+                        [line rangeOfString:@"[H5]"].location != NSNotFound)
+
+                        [hl appendFormat:@"%@\n", line];
+
+                }];
+
+                if ([hl length])
+
+                    [out appendFormat:@"\n\n===== 自愈阶梯结论（v80，先看这段）=====\n%@", hl];
+
+            }
+
+        } @catch (NSException *e) { }
+
         for (NSString *nm in names) {
 
             NSString *p = [doc stringByAppendingPathComponent:nm];
