@@ -308,6 +308,7 @@
 #define RB_KEEPALIVE         1        // 开关打开时盯场：状态不对就重新拉起
 
 #define RB_KEEPALIVE_SEC     12.0     // 盯场间隔（秒）
+#define RB_POST_WIPE_QUIET   25.0     // v74：抹后多少秒内不抢先拉隧道
 
 #define RB_RECONNECT_GAP     20.0     // 两次真实 start 之间的最小间隔，防止打太密
 
@@ -360,6 +361,71 @@
 #define RB_LOG_MAXBYTES (1LL << 20)
 
 
+
+
+// v74：把所有诊断产物合并成一个 txt，用户只转发这一个文件。
+// 内部 60 秒节流，不会拖慢日志路径。绝不调 rb_log（避免递归）。
+static double gReportTs = 0.0;
+
+static void rb_report_merge(void) {
+
+    double now = [[NSDate date] timeIntervalSince1970];
+
+    if (now - gReportTs < 60.0) return;
+
+    gReportTs = now;
+
+    @autoreleasepool {
+
+        NSString *h = NSHomeDirectory();
+
+        if (!h) return;
+
+        NSString *doc = [h stringByAppendingPathComponent:@"Documents"];
+
+        NSArray *names = [NSArray arrayWithObjects:@"rb-shim.log", @"rb-nodes.txt",
+
+                          @"rb-kc.txt", @"rb-node-hex.txt", @"rb-auth-sample.txt",
+
+                          @"rb-necfg.txt", nil];
+
+        NSMutableString *out = [NSMutableString stringWithCapacity:(1u << 19)];
+
+        [out appendFormat:@"# RelyVPN shim 合并报告（只需转发这一个文件）\n# %@\n",
+
+            [NSDate date]];
+
+        for (NSString *nm in names) {
+
+            NSString *p = [doc stringByAppendingPathComponent:nm];
+
+            NSString *s = [NSString stringWithContentsOfFile:p
+
+                                                    encoding:NSUTF8StringEncoding
+
+                                                       error:NULL];
+
+            if (!s) continue;
+
+            [out appendFormat:@"\n\n===== %@（%lu 字符）=====\n", nm, (unsigned long)[s length]];
+
+            if ([s length] > 400000) s = [s substringFromIndex:[s length] - 400000];
+
+            [out appendString:s];
+
+        }
+
+        [out writeToFile:[doc stringByAppendingPathComponent:@"rb-report.txt"]
+
+              atomically:YES
+
+                encoding:NSUTF8StringEncoding
+
+                   error:NULL];
+
+    }
+
+}
 
 static void rb_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
@@ -446,6 +512,10 @@ static void rb_log(const char *fmt, ...) {
     }
 
 #endif
+
+    // v74：顺手把全部诊断合并成一份，供用户转发
+
+    rb_report_merge();
 
 }
 
@@ -1180,6 +1250,7 @@ static void rb_set_ondemand(BOOL on);
 
 // force=1 表示「用户点了按钮」，此时即使自动连接开关是关的也要拉一次
 
+static int gQuietLogged = 0;      // v74：抹后静默期只报一次
 static void rb_start_vpn_once(int force);
 
 static void rb_node_rotate(void);
@@ -2823,7 +2894,11 @@ static int rb_wipe_all(void) {
 
     // 已经抹过 2 次还归零 → 说明保留的那一项里也有身份，这次连它一起清
 
-    int aggressive = [[rb_state() objectForKey:@"wipeCount"] intValue] >= 2 ? 1 : 0;
+    // v74：永久关掉（原来 >=2 次就全删）。rb-shim(16) 第 89/91 行实锤：
+    // 第 3 次抹除把唯一那项 keychain 删了，而它正是 NE 配置引用的密码项
+    // （rb-kc.txt svc=F6210F4B-... acct=E4D8CE0F-...），删完配置悬空，
+    // startVPNTunnel 报成功但隧道起不来 —— 连不上、还要重新授权。
+    int aggressive = 0;
 
     if (aggressive) rb_log("第 3 次抹除：本次连 VPN 配置引用的 keychain 项一起清");
 
@@ -3456,7 +3531,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v73 节点导出\n"];
+        [out appendString:@"# rb-shim v74 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -3905,6 +3980,30 @@ static void rb_start_vpn_once(int force) {
     gLastTryTs = rb_now();
 
     // v60：假连接封顶后正在冷却 → 这段时间一次都不拉（就是它防止死循环的）
+
+    // v74：抹完 25 秒内不主动拉。rb-shim(16) 第 43→46→47 行：抹后 4 秒就拉，
+    // 抢在 App 前面；那时配置还没建好/密码项刚被删，start 假成功，状态卡 1/3。
+    // 这 25 秒留给 App 自己（它被自拉起后会重写节点文件并建配置）。
+    if (!force) {
+
+        double lw = [[rb_state() objectForKey:@"lastWipeTs"] doubleValue];
+
+        if (lw > 0 && rb_now() - lw < RB_POST_WIPE_QUIET) {
+
+            if (!gQuietLogged) {
+
+                gQuietLogged = 1;
+
+                rb_log("抹后静默期：%.0f 秒内不抢先拉隧道，等 App 自己建配置连",
+                       RB_POST_WIPE_QUIET);
+
+            }
+
+            return;
+
+        }
+
+    }
 
     if (!force && gFakeFixCoolUntil > 0 && rb_now() < gFakeFixCoolUntil) {
 
@@ -6978,13 +7077,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v73 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v74 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v73 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v74 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
