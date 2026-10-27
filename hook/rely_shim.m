@@ -6407,6 +6407,16 @@ uint64_t rely_transport_send_fire_and_forget(uint64_t a0, uint64_t a1, uint64_t 
 
     if (!gFireAndForget) return (uint64_t)-1;
 
+    // v77 自检：transport 有两条发送路径，request 带回调、这条不带。
+    // IssueNodeToken 如果走的是这里，前面只抓 request 就会漏掉。
+    @autoreleasepool {
+
+        uint64_t v[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
+
+        for (int i = 0; i + 1 < 8; i++) rb_trace_frame("out", "ff", v[i], v[i + 1]);
+
+    }
+
     return gFireAndForget(a0, a1, a2, a3, a4, a5, a6, a7);
 
 }
@@ -7382,7 +7392,9 @@ static void rb_init(void) {
 
                     NSData *cur = [NSData dataWithContentsOfFile:f];
 
-                    if (cur && gNodeWrote && [cur isEqualToData:gNodeWrote]) {
+                    // 文件不存在 = App 把它删了准备重选，但 45 秒了还没写回来，
+                    // 一样走安全网。
+                    if (!cur || (gNodeWrote && [cur isEqualToData:gNodeWrote])) {
 
                         rb_log("自检安全网：45 秒了 App 还没重新申请（文件还是剥版）"
                                "—— 剥凭据这条路走不通，原样写回旧节点，先保住能连");
