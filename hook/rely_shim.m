@@ -7449,6 +7449,7 @@ static void rb_tick(void) {
 
 static volatile int gHealStep = 0;      // 已执行到第几级
 static int          gHealDone = 0;      // 连上 / 放弃，永久停
+static int          gHealWait = 0;      // 连续「连接中」等待次数，防止拆了又拆
 static char         gHealIps[RB_HEAL_IPS][24];
 static volatile int gHealIpN = 0;
 
@@ -7731,6 +7732,21 @@ static void rb_heal_tick(void) {
                        vs, gRateKBps);
                 gHealDone = 1;
                 return;
+            }
+
+            // v80 自检：状态 2 是「正在连接」，握手本来就要几十秒。
+            // 到点就拆会变成 v58 那种「停→拉→判→停」的死循环，越治越连不上。
+            // 所以在连接中且刚拉起不久时只等不动，最多等 6 次（150 秒）。
+            {
+                double sinceStart = (gLastStartTs > 0) ? (rb_now() - gLastStartTs) : 999.0;
+                if (vs == 2 && sinceStart < 60.0 && gHealWait < 6) {
+                    gHealWait++;
+                    rb_log("[HEAL] 状态 2（正在连接）已 %.0f 秒，先不打断（第 %d/6 次等待），"
+                           "%.0f 秒后再看", sinceStart, gHealWait, (double)RB_HEAL_STEP_SEC);
+                    rb_heal_tick();
+                    return;
+                }
+                gHealWait = 0;
             }
 
             gHealStep++;
