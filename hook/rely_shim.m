@@ -1994,6 +1994,120 @@ static BOOL rb_just_wiped(void) {
 
 
 
+// v70：把节点文件里的「账号-节点授权串」等长替换成随机值。
+// 判据来自两份真实导出：大写 36hex（B72009F2-4787-…）两次导出完全一致 = 节点 ID，保留；
+// 小写 36hex（988197b0-255c-…）= 授权串，是旧账号签发的，留着就是限速根因。
+// 等长替换不改变文件结构（长度前缀编码不受影响），App 解析不会出问题。
+static NSData *rb_deauth_data(NSData *d) {
+
+    if (!d || [d length] < 36) return d;
+
+    NSUInteger n = [d length];
+
+    const uint8_t *b = (const uint8_t *)[d bytes];
+
+    NSMutableData *out = [NSMutableData dataWithData:d];
+
+    uint8_t *o = (uint8_t *)[out mutableBytes];
+
+    static const char hexc[] = "0123456789abcdef";
+
+    int hits = 0;
+
+    for (NSUInteger i = 0; i + 36 <= n; i++) {
+
+        BOOL ok = YES;
+
+        int letters = 0;
+
+        for (NSUInteger k = 0; k < 36; k++) {
+
+            char c = (char)b[i + k];
+
+            if (k == 8 || k == 13 || k == 18 || k == 23) {
+
+                if (c != '-') { ok = NO; break; }
+
+                continue;
+
+            }
+
+            if (c >= '0' && c <= '9') continue;
+
+            if (c >= 'a' && c <= 'f') { letters++; continue; }
+
+            ok = NO;
+
+            break;
+
+        }
+
+        if (!ok || letters == 0) continue;
+
+        for (NSUInteger k = 0; k < 36; k++) {
+
+            if (k == 8 || k == 13 || k == 18 || k == 23) { o[i + k] = '-'; continue; }
+
+            o[i + k] = (uint8_t)hexc[arc4random_uniform(16)];
+
+        }
+
+        hits++;
+
+        i += 35;
+
+    }
+
+    if (hits) rb_log("节点授权串已作废 %d 处（等长随机替换，节点 ID 保留、文件长度不变）"
+                     " —— App 连接时会用新身份重新签发", hits);
+
+    return out;
+
+}
+
+
+
+// v70：把节点文件原样以 16 进制导出来，下一轮做「授权请求重放」时要用。
+static void rb_node_hex_dump(NSData *d, NSString *name) {
+
+    @try {
+
+        if (!d || [d length] == 0) return;
+
+        NSMutableString *ms = [NSMutableString string];
+
+        NSUInteger n = [d length];
+
+        const uint8_t *b = (const uint8_t *)[d bytes];
+
+        for (NSUInteger i = 0; i < n; i++) {
+
+            [ms appendFormat:@"%02x", b[i]];
+
+            if ((i % 32) == 31) [ms appendString:@"\n"];
+
+        }
+
+        NSString *p = [NSHomeDirectory()
+
+                       stringByAppendingPathComponent:@"Documents/rb-node-hex.txt"];
+
+        NSString *txt = [NSString stringWithFormat:@"%@ %lu bytes\n%@\n",
+
+                         name, (unsigned long)n, ms];
+
+        [txt writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+
+        rb_log("节点文件原文已导出 Documents/rb-node-hex.txt（%lu 字节）",
+
+               (unsigned long)n);
+
+    } @catch (NSException *e) { }
+
+}
+
+
+
 static void rb_node_files_restore(void);   // v68 前向声明（下面的 _direct 要用）
 
 // 不论是不是刚抹完、都真的写一次（bounce 兜底用）
@@ -2050,6 +2164,11 @@ static void rb_node_files_restore(void) {
             NSDictionary *ex = [fm attributesOfItemAtPath:full error:NULL];
 
             if (ex && [ex fileSize] > 0) continue;
+
+            // v70：写回之前把授权串作废（大写节点 ID 保留）
+            d = rb_deauth_data(d);
+
+            rb_node_hex_dump(d, it);
 
             [fm createDirectoryAtPath:[full stringByDeletingLastPathComponent]
 
@@ -2224,10 +2343,6 @@ static void rb_node_rotate(void) {
             // v69：rb-shim(13) 日志实证 —— 没有节点文件的时候 rotate 仍然照停照拉，
             // 4 次下来把本来可能连上的隧道反复打断。没东西可删就别动隧道。
             rb_log("换节点：没有旧节点文件可丢（App 还没选定节点文件）—— 不动隧道");
-
-            rb_ne_drop_configs("换节点（无节点文件）");
-
-            rb_ne_watch_config(60);
 
             return;
 
@@ -2451,12 +2566,9 @@ static int rb_wipe_all(void) {
     rb_log("抹完是干净状态：不写回旧节点文件（旧认证串会被限速），"
            "由 App 用新身份自己选；真的连不上 45 秒后才兜底");
 
-    // v69：系统里的 VPN 配置也必须删 —— 它带着旧节点的 providerConfiguration，
-    // 留着就等于抹完还是连回旧节点（rb-shim(13) 第 45 行「读到 1 个配置」= 限速根）
-    rb_ne_drop_configs("抹除");
-
-    // App 什么时候把配置建回来不知道，盯着，一建好就替它按连接
-    rb_ne_watch_config(120);
+    // v70：这里**不删** VPN 配置。v69 试过删 —— 删掉之后系统每次都要弹
+    // 「允许添加 VPN 配置」授权，每轮抹除多一次授权点击，比不删更糟。
+    // 配置留着：节点选择、隧道参数都在，只是不碰它。
 
 
 
@@ -3035,7 +3147,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v69 节点导出\n"];
+        [out appendString:@"# rb-shim v70 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -6494,11 +6606,16 @@ static void rb_init(void) {
 
         if (rb_just_wiped()) {
 
-            // v68：刚抹完 —— 不写回旧节点，让 App 用新身份自己选。
-            rb_log("这次是抹数据后启动：不写回旧节点文件，让 App 用新身份重新选"
-                   "（旧节点认证串 = 限速根因）");
+            // v70：照常写回节点文件（否则 App 一定弹节点选择页、要你手点），
+            // 但写回时授权串已被作废 —— 有节点、无有效授权，让 App 用新身份重新签发。
+            rb_log("这次是抹数据后启动：写回节点文件但作废旧授权串，"
+                   "让 App 用新身份重新签发（不弹节点选择页）");
 
-            // App 一旦自己定下来（重写 currentNodeWithReason.bin），立刻拉隧道
+            rb_node_files_restore();
+
+            rb_prefs_restore();
+
+            // App 一旦自己重新签发并重写文件，立刻拉隧道
             rb_node_watch_new(RB_NODE_WATCH_MAX);
 
         } else {
@@ -6550,13 +6667,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v69 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v70 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v69 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v70 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
