@@ -224,7 +224,11 @@
 // 服务端按旧账号记账，直接压成福利限速（v66 日志：抹后 82 秒只跑 0.7MB、10.8 KB/s，
 // 正常是 8000+ KB/s）。所以抹完之后要「查一遍速率」，被限速就把旧节点丢掉，
 // 让 App 用新身份重新申请节点。
-#define RB_NODE_ROTATE_ON    1          // v78：重新打开。v72 关它的理由是判据错
+#define RB_NODE_ROTATE_ON    0          // v80：彻底关掉 —— rb-shim(20) 第 71→72→74 行
+                                       // 它把「抹后还在握手的 0 KB/s」判成限速，删掉
+                                       // 节点文件+停隧道，正好把 45 秒安全网刚写回的
+                                       // 文件删了 → 永远卡「正在连接」。
+                                       // 手动换节点走面板 b8 按钮，不受这个开关影响。
                                        // （把「用户没在用」的瞬时 20KB/s 判成限速）；
                                        // 现在改成看抹后平均速率，且用户实测
                                        // 「手动换节点就恢复」，这条自动化等价于那一步
@@ -1261,6 +1265,11 @@ static int gQuietLogged = 0;      // v74：抹后静默期只报一次
 static void rb_start_vpn_once(int force);
 
 static void rb_node_rotate(void);
+static void rb_heal_boot(void);
+static void rb_heal_tick(void);
+static void rb_heal_do(int n);
+static void rb_scan_ips(const uint8_t *b, size_t n);
+static NSData *rb_node_replace_ip(NSData *d, const char *ip);
 
 static void rb_node_watch_new(int left);
 
@@ -3755,7 +3764,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v79 节点导出\n"];
+        [out appendString:@"# rb-shim v80 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -4787,7 +4796,46 @@ static void rb_auto_start_vpn(int attempt) {
 
                 if (cur == 2 || cur == 3 || cur == 4) {
 
-                    rb_log("自动重连：已经在连了，不动");
+                    // v80：这里原来无条件「已经在连了，不动」—— 卡死的死等点。
+                    // rb-shim(20) 第 60→61 行：抹后一个空壳隧道把状态钉在 2，
+                    // 这里直接返回，之后没有任何人再管 → 「正在连接」转到「连接超时」。
+                    // 现在按时间判：连上且有流量才不动；状态 2/4 卡过 45 秒就停掉重拉。
+                    double since = (gLastStartTs > 0) ? (rb_now() - gLastStartTs)
+                                                      : (rb_now() - gBootAt);
+                    BOOL wet = (gLastTrafficTs > 0 &&
+                                rb_now() - gLastTrafficTs < 30.0);
+
+                    if (cur == 3 && wet) {
+
+                        rb_log("自动重连：已连接且有流量（30 秒内），不动");
+
+                        return;
+
+                    }
+
+                    if (since < RB_START_STUCK_SEC) {
+
+                        rb_log("自动重连：状态 %d 已 %.0f 秒（%.0f 秒内不打断），继续等",
+                               cur, since, (double)RB_START_STUCK_SEC);
+
+                        return;
+
+                    }
+
+                    rb_log("自动重连：状态 %d 卡了 %.0f 秒还没连上 —— 停掉，3 秒后重拉",
+                           cur, since);
+
+                    rb_stop_vpn();
+
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+
+                                                 (int64_t)(3 * NSEC_PER_SEC)),
+
+                                   dispatch_get_main_queue(), ^{
+
+                        @autoreleasepool { rb_start_vpn_once(1); }
+
+                    });
 
                     return;
 
@@ -6202,6 +6250,7 @@ static void rb_trace_frame(const char *dir, const char *from,
     size_t got = rb_read((const void *)(uintptr_t)p, tmp, (size_t)len);
 
     if (got < 8) { free(tmp); return; }
+    rb_scan_ips(tmp, got);   // v80：顺手攒节点 IP，给自愈阶梯 H3 用
 
     @autoreleasepool {
 
@@ -7389,6 +7438,319 @@ static void rb_tick(void) {
 
 
 
+// ==================== v80 自愈阶梯（H1 → H5） ====================
+// 目的：抹完数据后，「能不能连上、走哪条路能连上」一次跑完，日志里带编号，
+// 用户把 rb-report 发回来，grep [HEAL] 就知道哪一级有效，不用一轮一轮试。
+// 触发条件：只在「上次抹除后 300 秒内」且「还没连上」时运行 —— 正常使用时绝不插手，
+// 免得像 v78 的节点体检那样把好端端的隧道拆掉。
+#define RB_HEAL_IPS      64
+#define RB_HEAL_STEP_SEC 25.0
+#define RB_HEAL_WINDOW   300.0
+
+static volatile int gHealStep = 0;      // 已执行到第几级
+static int          gHealDone = 0;      // 连上 / 放弃，永久停
+static char         gHealIps[RB_HEAL_IPS][24];
+static volatile int gHealIpN = 0;
+
+static int rb_str_same(const char *a, const char *b) {
+    int i = 0;
+    while (a[i] && b[i]) { if (a[i] != b[i]) return 0; i++; }
+    return (a[i] == 0 && b[i] == 0);
+}
+
+static int rb_str_starts(const char *s, const char *p) {
+    int i = 0;
+    while (p[i]) { if (s[i] != p[i]) return 0; i++; }
+    return 1;
+}
+
+static int rb_ip_skip(const char *s) {
+    return (rb_str_starts(s, "0.") || rb_str_starts(s, "10.") ||
+            rb_str_starts(s, "127.") || rb_str_starts(s, "192.168.") ||
+            rb_str_starts(s, "169.254.") || rb_str_starts(s, "255."));
+}
+
+// 在报文里扫形如 d.d.d.d 的 ASCII 明文（protobuf 里的 IP 都是裸字符串）
+static void rb_scan_ips(const uint8_t *b, size_t n) {
+    size_t i = 0;
+    if (!b || n < 7) return;
+    while (i + 6 < n && gHealIpN < RB_HEAL_IPS) {
+        size_t st = i, k = i;
+        int oct = 0, ok = 1;
+        while (oct < 4) {
+            int d = 0, cur = 0;
+            while (k < n && b[k] >= '0' && b[k] <= '9' && d < 3) {
+                cur = cur * 10 + (b[k] - '0'); k++; d++;
+            }
+            if (d == 0 || cur > 255) { ok = 0; break; }
+            oct++;
+            if (oct == 4) break;
+            if (k < n && b[k] == '.') { k++; continue; }
+            ok = 0; break;
+        }
+        if (ok && oct == 4 && (k >= n || b[k] < '0' || b[k] > '9')) {
+            size_t L = k - st;
+            char buf[24];
+            if (L > 0 && L < 24) {
+                size_t z;
+                for (z = 0; z < L; z++) buf[z] = (char)b[st + z];
+                buf[L] = 0;
+                if (!rb_ip_skip(buf)) {
+                    int q, dup = 0;
+                    for (q = 0; q < gHealIpN; q++)
+                        if (rb_str_same(gHealIps[q], buf)) { dup = 1; break; }
+                    if (!dup) {
+                        int t;
+                        for (t = 0; t <= (int)L; t++) gHealIps[gHealIpN][t] = buf[t];
+                        gHealIpN++;
+                    }
+                }
+            }
+            i = k;
+        } else {
+            i = st + 1;
+        }
+    }
+}
+
+static void rb_pb_varint(NSMutableData *o, uint64_t v) {
+    while (v >= 0x80) {
+        uint8_t c = (uint8_t)((v & 0x7f) | 0x80);
+        [o appendBytes:&c length:1];
+        v >>= 7;
+    }
+    uint8_t c = (uint8_t)(v & 0x7f);
+    [o appendBytes:&c length:1];
+}
+
+// 只替换节点文件里 field 1（节点 IP），其余字段一个字节都不动。
+// 结构解析不了就返回 nil —— 调用方跳过这一级，绝不写坏文件。
+static NSData *rb_node_replace_ip(NSData *d, const char *ip) {
+    if (!d || [d length] < 8 || !ip || !ip[0]) return nil;
+    NSUInteger n = [d length], ipLen = 0;
+    const uint8_t *b = (const uint8_t *)[d bytes];
+    NSMutableData *out = [NSMutableData dataWithCapacity:n + 8];
+    NSUInteger i = 0;
+    int replaced = 0;
+    while (ip[ipLen]) ipLen++;
+    while (i < n) {
+        NSUInteger tagSt = i;
+        uint64_t key = 0;
+        int sh = 0;
+        while (i < n && sh <= 63) {
+            uint8_t c = b[i++];
+            key |= (uint64_t)(c & 0x7f) << sh;
+            sh += 7;
+            if (!(c & 0x80)) break;
+        }
+        if (sh <= 0 || sh > 63) return nil;
+        int field = (int)(key >> 3);
+        int wt = (int)(key & 7);
+        if (wt == 2) {
+            uint64_t L = 0;
+            sh = 0;
+            while (i < n && sh <= 63) {
+                uint8_t c = b[i++];
+                L |= (uint64_t)(c & 0x7f) << sh;
+                sh += 7;
+                if (!(c & 0x80)) break;
+            }
+            if (sh <= 0 || sh > 63 || i + (NSUInteger)L > n) return nil;
+            if (field == 1 && !replaced) {
+                uint8_t tg = 0x0a;
+                [out appendBytes:&tg length:1];
+                rb_pb_varint(out, (uint64_t)ipLen);
+                [out appendBytes:ip length:ipLen];
+                replaced = 1;
+            } else {
+                [out appendBytes:(b + tagSt) length:(NSUInteger)(i - tagSt) + (NSUInteger)L];
+            }
+            i += (NSUInteger)L;
+        } else if (wt == 0) {
+            sh = 0;
+            while (i < n && sh <= 63) {
+                uint8_t c = b[i++];
+                sh += 7;
+                if (!(c & 0x80)) break;
+            }
+            if (sh <= 0 || sh > 63) return nil;
+            [out appendBytes:(b + tagSt) length:(NSUInteger)(i - tagSt)];
+        } else if (wt == 5) {
+            if (i + 4 > n) return nil;
+            i += 4;
+            [out appendBytes:(b + tagSt) length:(NSUInteger)(i - tagSt)];
+        } else if (wt == 1) {
+            if (i + 8 > n) return nil;
+            i += 8;
+            [out appendBytes:(b + tagSt) length:(NSUInteger)(i - tagSt)];
+        } else {
+            return nil;
+        }
+    }
+    if (!replaced) return nil;
+    return out;
+}
+
+static NSString *rb_heal_best_ip(void) {
+    NSString *best = nil;
+    double bestMs = 1e9;
+    int i, lim = (gHealIpN > 12) ? 12 : gHealIpN;   // 最多测 12 个，别卡太久
+    for (i = 0; i < lim; i++) {
+        double ms = rb_tcp_rtt(gHealIps[i], 443);
+        if (ms >= 0 && ms < bestMs) {
+            bestMs = ms;
+            best = [NSString stringWithUTF8String:gHealIps[i]];
+        }
+    }
+    return best;
+}
+
+static void rb_heal_apply(int n) {
+    @try {
+        switch (n) {
+        case 1:
+            rb_log("[H1] 写回节点文件（剥掉旧授权串版，让 App 自己补凭据）");
+            rb_node_files_restore();
+            break;
+        case 2:
+            rb_log("[H2] 写回节点文件（原样：带旧凭据 f14.f2 和授权串 f22）");
+            rb_node_files_restore_raw();
+            break;
+        case 3: {
+            NSString *ip = rb_heal_best_ip();
+            NSString *f = [rb_node_dir()
+                           stringByAppendingPathComponent:@"currentNodeWithReason.bin"];
+            if (!ip) {
+                rb_log("[H3] 报文里没攒到候选节点 IP（当前 %d 个），跳过这一级",
+                       (int)gHealIpN);
+                break;
+            }
+            NSData *cur = [NSData dataWithContentsOfFile:f];
+            if (!cur) {
+                NSDictionary *pick = [rb_state() objectForKey:RB_NODEFILES_KEY];
+                if ([pick isKindOfClass:[NSDictionary class]])
+                    cur = [pick objectForKey:@"currentNodeWithReason.bin"];
+            }
+            if (!cur) {
+                rb_log("[H3] 既没有当前节点文件也没有快照，跳过这一级");
+                break;
+            }
+            NSData *nd = rb_node_replace_ip(cur, [ip UTF8String]);
+            if (!nd) {
+                rb_log("[H3] 节点文件 protobuf 结构解析不了（%lu 字节），跳过这一级",
+                       (unsigned long)[cur length]);
+                break;
+            }
+            [cur writeToFile:[f stringByAppendingString:@".bak_h3"] atomically:YES];
+            [[NSFileManager defaultManager] createDirectoryAtPath:rb_node_dir()
+                                    withIntermediateDirectories:YES attributes:nil
+                                                     error:NULL];
+            if ([nd writeToFile:f atomically:YES])
+                rb_log("[H3] 换成报文列表里 TCP 最快的节点 %s（候选 %d 个），"
+                       "节点文件 %lu → %lu 字节",
+                       [ip UTF8String], (int)gHealIpN,
+                       (unsigned long)[cur length], (unsigned long)[nd length]);
+            else
+                rb_log("[H3] 写入节点文件失败");
+            break;
+        }
+        case 4: {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *dir = rb_node_dir();
+            int dn = 0;
+            for (NSString *it in ([fm contentsOfDirectoryAtPath:dir error:NULL] ?: @[])) {
+                if (!rb_is_node_file(it)) continue;
+                if ([fm removeItemAtPath:[dir stringByAppendingPathComponent:it]
+                                   error:NULL]) dn++;
+            }
+            rb_log("[H4] 丢掉 %d 个节点文件，交给 App 自己重选（watch 盯着文件出现）", dn);
+            rb_node_watch_new(RB_NODE_WATCH_MAX);
+            break;
+        }
+        case 5:
+            rb_log("[H5] 最后一招：自拉起 App，重走注册 / 授权");
+            rb_relaunch();
+            return;
+        default:
+            break;
+        }
+    } @catch (NSException *e) {
+        rb_log("[HEAL] 第 %d 级抛异常：%s", n, [[e reason] UTF8String]);
+    }
+}
+
+static void rb_heal_do(int n) {
+    rb_heal_apply(n);
+    if (n >= 5) return;
+    rb_log("[HEAL] 第 %d 级已执行，3 秒后重拉隧道；%.0f 秒后看结果，不通就进下一级",
+           n, (double)RB_HEAL_STEP_SEC);
+    rb_stop_vpn();
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @autoreleasepool { rb_start_vpn_once(1); }
+    });
+}
+
+static void rb_heal_tick(void) {
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(RB_HEAL_STEP_SEC * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        @autoreleasepool {
+            if (gHealDone) return;
+
+            double lw = [[rb_state() objectForKey:@"lastWipeTs"] doubleValue];
+            if (lw <= 0 || rb_now() - lw > RB_HEAL_WINDOW) {
+                rb_log("[HEAL] 距上次抹除 %.0f 秒，超出观察窗口，阶梯停止（第 %d 级为止）",
+                       (lw > 0) ? rb_now() - lw : -1.0, gHealStep);
+                gHealDone = 1;
+                return;
+            }
+
+            int vs = rb_vpn_status();
+            BOOL wet = (gLastTrafficTs > 0 && rb_now() - gLastTrafficTs < 30.0);
+
+            if (vs == 3 && wet) {
+                rb_log("[HEAL] ✅ 连上了：第 %d 级之后状态 3 且有流量，速率 %.1f KB/s —— "
+                       "这一级就是有效的那条路", gHealStep, gRateKBps);
+                gHealDone = 1;
+                return;
+            }
+
+            if (gHealStep >= 5) {
+                rb_log("[HEAL] ❌ H1~H5 全试过仍未连上（状态 %d，速率 %.1f KB/s）",
+                       vs, gRateKBps);
+                gHealDone = 1;
+                return;
+            }
+
+            gHealStep++;
+            rb_heal_do(gHealStep);
+            rb_heal_tick();
+        }
+    });
+}
+
+static void rb_heal_boot(void) {
+    if (gHealDone) return;
+
+    // v80 自检：H5 会自拉起 App，新进程会重新挂阶梯 —— 不清计数就会「拉起→阶梯→拉起」
+    // 转圈。一个抹除周期最多两轮，抹数据会把这个计数一起清掉。
+    NSMutableDictionary *hs = rb_state();
+    int runs = [[hs objectForKey:@"healRuns"] intValue];
+    if (runs >= 2) {
+        rb_log("[HEAL] 本周期已经跑过 %d 轮阶梯，不再重复（防自拉起循环）", runs);
+        gHealDone = 1;
+        return;
+    }
+    [hs setObject:[NSNumber numberWithInt:(runs + 1)] forKey:@"healRuns"];
+    rb_state_save(hs);
+
+    rb_log("[HEAL] 启动自愈阶梯（第 %d 轮）：H1 写回剥版 → H2 写回原版 → "
+           "H3 换列表最快节点 → H4 交给 App 重选 → H5 自拉起（每级 %.0f 秒）",
+           runs + 1, (double)RB_HEAL_STEP_SEC);
+    rb_heal_tick();
+}
+
 __attribute__((constructor))
 
 static void rb_init(void) {
@@ -7417,30 +7779,13 @@ static void rb_init(void) {
             // 旧节点文件把新身份钉在这个非推荐节点上 → 直接吃福利档 30 KB/s。
             // 抹前同一 IP 能跑 8190 KB/s，说明节点本身没坏，是「新身份连非推荐节点」的问题。
             // 手动切节点就是走这份推荐列表，所以只有手动切才恢复 —— 现在把这一步交给 App。
-            rb_log("这次是抹数据后启动：清空旧节点文件（v79）—— App 会从服务端推荐列表"
-                   "（38.246.249.177 香港 61ms 等）重新选，选中后 watch 自动拉起隧道");
+            // v80：抹后一定要有节点文件。pid=21319 就是「抹后启动就写回」
+            // 的配置，实测 7300.9 KB/s / 139.4 MB；而 v79「清空等 App 自己选」
+            // 的 pid=21325 全程没有文件，状态钉在 2，最后连接超时。
+            rb_log("这次是抹数据后启动：启动就写回节点文件（v80）—— 磁盘上没有节点文件时，"
+                   "provider 起来无处可连，隧道会一直停在「正在连接」直到超时");
 
-            // 先关 on-demand：系统会在 App 写完节点文件之前就把 provider 拉起来，
-            // provider 起来时没有节点文件 → 永远卡「连接中」（v66 记过的老坑）。
-            // start 路径里会重新打开。
-            rb_set_ondemand(NO);
-
-            {
-                NSString *ndir = rb_node_dir();
-                NSFileManager *nfm = [NSFileManager defaultManager];
-                int dn = 0;
-
-                for (NSString *it in ([nfm contentsOfDirectoryAtPath:ndir error:NULL] ?: @[])) {
-
-                    if (!rb_is_node_file(it)) continue;
-
-                    if ([nfm removeItemAtPath:[ndir stringByAppendingPathComponent:it]
-                                        error:NULL]) dn++;
-
-                }
-
-                rb_log("抹后清空旧节点文件 %d 个（快照仍保留，45 秒兜底用）", dn);
-            }
+            rb_node_files_restore();
 
             rb_prefs_restore();
 
@@ -7546,13 +7891,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v79 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v80 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v79 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v80 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
@@ -7621,6 +7966,9 @@ static void rb_init(void) {
             rb_log("抹除后重开：进入快速通道（宽限 %.0fs / 冷却 %.0fs），即将自动重连",
 
                    (double)RB_GRACE_FAST_SEC, (double)RB_COOL_FAST_SEC);
+
+            // v80：抹后就把自愈阶梯挂上，H1~H5 逐级试，日志带编号
+            rb_heal_boot();
 
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
 
