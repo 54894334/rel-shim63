@@ -2265,6 +2265,8 @@ static NSData *rb_strip_auth(NSData *d) {
 
     int hits = 0;
 
+    int credHits = 0;      // v77：被剥掉的节点凭据 f14.f2 个数
+
     while (i < n) {
 
         NSUInteger st = i;
@@ -2351,14 +2353,132 @@ static NSData *rb_strip_auth(NSData *d) {
 
         if (field == 22) { hits++; continue; }   // 授权串：整段不拷贝
 
+        // v77：f14 = { f1 = 端口, f2 = 节点凭据 UUID }。
+        // 只删 f22 时 App 照样拿 f14.f2 直接连（v73/v76 日志里 280→319、298→337
+        // 正好 +39 字节 = f22 编码长度，证明它只补授权、不重新申请）。
+        // 凭据留着 = 服务端认出旧节点会话 = 按已用满 300MB 压 160Kbps。
+        // v65 唯一一次 8312.3 KB/s，写回的节点文件正是 76 字节（无 f22、无 f14.f2）。
+        if (field == 14 && wt == 2 && L > 0) {
+
+            const uint8_t *sub = b + i;
+            NSUInteger subN = (NSUInteger)L;
+
+            NSMutableData *kept = [NSMutableData dataWithCapacity:subN];
+
+            NSUInteger j = 0;
+
+            while (j < subN) {
+
+                NSUInteger st2 = j;
+
+                uint64_t k2 = 0;
+
+                int s2 = 0;
+
+                while (j < subN && s2 <= 63) {
+
+                    uint8_t c = sub[j++];
+
+                    k2 |= (uint64_t)(c & 0x7f) << s2;
+
+                    s2 += 7;
+
+                    if (!(c & 0x80)) break;
+
+                }
+
+                if (s2 > 63) break;
+
+                int f2 = (int)(k2 >> 3);
+
+                int w2 = (int)(k2 & 7);
+
+                if (w2 == 2) {
+
+                    uint64_t L2 = 0;
+
+                    s2 = 0;
+
+                    while (j < subN && s2 <= 63) {
+
+                        uint8_t c = sub[j++];
+
+                        L2 |= (uint64_t)(c & 0x7f) << s2;
+
+                        s2 += 7;
+
+                        if (!(c & 0x80)) break;
+
+                    }
+
+                    if (s2 > 63) break;
+
+                    if (j + L2 > subN) break;
+
+                    j += (NSUInteger)L2;
+
+                } else if (w2 == 0) {
+
+                    s2 = 0;
+
+                    while (j < subN && s2 <= 63) {
+
+                        uint8_t c = sub[j++];
+
+                        s2 += 7;
+
+                        if (!(c & 0x80)) break;
+
+                    }
+
+                    if (s2 > 63) break;
+
+                } else {
+
+                    break;
+
+                }
+
+                if (f2 == 2) { credHits++; continue; }   // 节点凭据：整段不拷贝
+
+                [kept appendBytes:(sub + st2) length:(j - st2)];
+
+            }
+
+            if ([kept length] > 0 && [kept length] < 128) {
+
+                uint8_t kb = (uint8_t)(((uint64_t)14 << 3) | 2);
+
+                uint8_t lb = (uint8_t)[kept length];
+
+                [out appendBytes:&kb length:1];
+
+                [out appendBytes:&lb length:1];
+
+                [out appendData:kept];
+
+            } else {
+
+                credHits++;      // 子消息只剩空壳 → 整个 f14 丢掉
+
+            }
+
+            i += (NSUInteger)L;
+
+            continue;
+
+        }
+
         [out appendBytes:(b + st) length:(i - st)];
 
     }
 
-    if (hits) rb_log("节点文件已去掉 %d 处授权串（f22，整段删除，其余字段一字不动）—— "
-                     "现在是「有节点凭据、没有授权」，App 应当去申请新授权", hits);
+    if (hits || credHits)
+        rb_log("节点文件已去掉 %d 处授权串(f22) + %d 处节点凭据(f14.f2) —— "
+               "现在是「只有地址、没有身份」，逼 App 自己重新申请凭据和授权"
+               "（v77：凭据留着它就直接连旧会话，吃 160Kbps）", hits, credHits);
 
-    return (hits && i >= n) ? out : d;
+    return ((hits || credHits) && i >= n) ? out : d;
 
 }
 
@@ -3539,7 +3659,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v76 节点导出\n"];
+        [out appendString:@"# rb-shim v77 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -7054,8 +7174,8 @@ static void rb_init(void) {
 
             // v70：照常写回节点文件（否则 App 一定弹节点选择页、要你手点），
             // 但写回时授权串已被作废 —— 有节点、无有效授权，让 App 用新身份重新签发。
-            rb_log("这次是抹数据后启动：写回节点文件但作废旧授权串，"
-                   "让 App 用新身份重新签发（不弹节点选择页）");
+            rb_log("这次是抹数据后启动：写回节点文件但剥掉凭据+授权串（v77）—— "
+                   "App 必须自己重新申请，等效于程序化做了一次「手动切节点」");
 
             rb_node_files_restore();
 
@@ -7113,13 +7233,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v76 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v77 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v76 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v77 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
