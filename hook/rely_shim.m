@@ -2021,6 +2021,14 @@ static void rb_prefs_restore(void) {
 
     @try {
 
+        // v75：不再写回。rb-report 实锤：抹后 App 补回来的授权串（f22）
+        // 和抹除前那一模一样（534bb848-...），而节点文件里并没有它 ——
+        // 唯一来源就是这里写回去的节点类配置键。App 拿旧串不申请新授权，
+        // 服务端按旧 license 压 160Kbps。快照继续留着（备查），只是不写回。
+        rb_log("节点类配置键快照保留但不写回（v75）：写回去会把旧授权串一起带走，"
+               "App 就不去申请新授权，直接吃限速档");
+        return;
+
         NSDictionary *all = [rb_state() objectForKey:RB_PREFS_SNAP_KEY];
 
         if (![all isKindOfClass:[NSDictionary class]] || [all count] == 0) return;
@@ -3531,7 +3539,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v74 节点导出\n"];
+        [out appendString:@"# rb-shim v75 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -4297,6 +4305,17 @@ static void rb_start_vpn_once(int force) {
                     // 绝不允许像 v58 那样「停→拉→判→停」转成一圈接一圈的死循环。
 
                     if (gFakeFixCount >= RB_FAKE_FIX_MAX) {
+
+                        // v75：冷却没用 —— 截图实锤（体验餐剩 11.6 MB 还在
+                        // 「连接超时」），授权串失效时怎么 start 都过不了握手。
+                        // 直接自拉起重启：新进程重新注册/申请授权，最可靠。
+                        rb_log("自动连接：假连接已连续 %d 次仍不通（额度可能还没用完）"
+                               " —— v75 直接自拉起重启 App，重新走注册/授权",
+                               RB_FAKE_FIX_MAX);
+
+                        rb_relaunch();
+
+                        return;
 
                         gFakeFixCoolUntil = rb_now() + RB_FAKE_FIX_COOL;
 
@@ -7077,13 +7096,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v74 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v75 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v74 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v75 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
