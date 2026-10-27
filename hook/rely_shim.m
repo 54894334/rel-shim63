@@ -3539,7 +3539,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v75 节点导出\n"];
+        [out appendString:@"# rb-shim v76 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -5600,6 +5600,23 @@ static void rb_fire(const char *why, BOOL force) {
 
     double last = [[st objectForKey:@"lastWipeTs"] doubleValue];
 
+    // v76：抹后 120 秒内且本地 utun 累计 < 20MB —— 不可能真用完 300MB。
+    // rb-shim(17) 第 52→70 行实锤：新身份注册期服务端心跳异常（len=101
+    // 短包被判归零），1.5 秒后把刚建好的新身份又抹了，连续两次把 App
+    // 摁死在注册阶段（截图：体验餐剩 300 MB 却「连接超时」）。
+    // 真用完必然有约 300MB 过 utun，这个守卫不会漏掉真实归零。
+    if (!force && last > 0 && now - last < 120.0 &&
+
+        gFlowAcc < (uint64_t)(20ull << 20)) {
+
+        rb_log("抹后 %.0f 秒本地只跑 %.1f MB —— 不可能真用完，挡掉这次「%s」"
+               "（v76：注册期服务端心跳不可信）", now - last,
+               (double)gFlowAcc / 1048576.0, why);
+
+        return;
+
+    }
+
 
 
     if (gStopped && !force) return;
@@ -7096,13 +7113,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v75 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v76 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v75 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v76 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
