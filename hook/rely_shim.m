@@ -7263,15 +7263,19 @@ static void rb_init(void) {
 
             // v70：照常写回节点文件（否则 App 一定弹节点选择页、要你手点），
             // 但写回时授权串已被作废 —— 有节点、无有效授权，让 App 用新身份重新签发。
-            rb_log("这次是抹数据后启动：写回节点文件但剥掉凭据+授权串（v77）—— "
-                   "App 必须自己重新申请，等效于程序化做了一次「手动切节点」");
-
-            rb_node_files_restore();
+            // v77：不再预先写回节点文件。
+            // 写回哪个节点，App 就连哪个 —— 而我们的快照里永远是上一次连的那个。
+            // rb-shim(18) 抹后一直连新加坡 139.162.54.90（1588 KB/s），
+            // 用户手动切到香港才恢复。留空让 App 自己拉服务端列表按体验分选，
+            // 等于把手动切节点这一步程序化。
+            // 24 秒（6 × RB_NODE_WATCH_SEC）等不到，25 秒兜底再写回快照。
+            rb_log("这次是抹数据后启动：不写回节点文件（v77）—— "
+                   "交给 App 自己从服务端拉列表按体验分选，等效于自动切一次节点；"
+                   "%.0f 秒内没选上就写回快照兜底", (double)RB_POST_WIPE_FALLBACK_SEC);
 
             rb_prefs_restore();
 
-            // App 一旦自己重新签发并重写文件，立刻拉隧道
-            rb_node_watch_new(RB_NODE_WATCH_MAX);
+            rb_node_watch_new(6);
 
         } else {
 
@@ -7441,9 +7445,14 @@ static void rb_init(void) {
 
                     } else {
 
-                        rb_log("抹后兜底：%.0f 秒内 App 没重写节点文件 —— 走正常自动重连",
-
+                        // v77：抹后没写回节点文件，这里先把快照补回去再拉起，
+                        // 否则隧道起来时没有节点文件，App 会停在节点选择页。
+                        rb_log("抹后兜底：%.0f 秒内 App 没选节点 —— 写回快照节点后再拉起",
                                (double)RB_POST_WIPE_FALLBACK_SEC);
+
+                        if (!rb_node_files_restore_direct())
+
+                            rb_log("抹后兜底：快照里没有节点文件，直接拉起（App 会自己选）");
 
                         rb_auto_start_vpn(0);
 
