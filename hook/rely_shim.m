@@ -224,16 +224,23 @@
 // 服务端按旧账号记账，直接压成福利限速（v66 日志：抹后 82 秒只跑 0.7MB、10.8 KB/s，
 // 正常是 8000+ KB/s）。所以抹完之后要「查一遍速率」，被限速就把旧节点丢掉，
 // 让 App 用新身份重新申请节点。
-#define RB_NODE_ROTATE_ON    0          // v72：关掉。rb-shim(12)(13)(14) 三份日志实证它
+#define RB_NODE_ROTATE_ON    1          // v78：重新打开。v72 关它的理由是判据错
+                                       // （把「用户没在用」的瞬时 20KB/s 判成限速）；
+                                       // 现在改成看抹后平均速率，且用户实测
+                                       // 「手动换节点就恢复」，这条自动化等价于那一步
                                        // 每次都把刚连好的隧道拆掉，收益从未被证实。
                                        // 要试就改回 1（面板 b8 手动按钮不受这个开关影响）
 #define RB_NODE_SELF_SEC     180.0      // 抹除后这么久内算「刚抹完」→ 不写回旧节点，让 App 自己选
-#define RB_NODE_LIMIT_KBPS   500.0      // 抹后持续低于这个速率（KB/s）判为节点被限速
+#define RB_NODE_LIMIT_KBPS   150.0      // v78：抹后平均速率低于这个（KB/s）才动手。
+                                       // 160Kbps 福利档 ≈ 20 KB/s，正常 8000+，150 是很宽的门槛
 #define RB_NODE_OBS_SEC      20.0       // 观测窗口：连着这么久都低速才动手
-#define RB_NODE_OBS_ARM_SEC  8.0        // 抹完前这些秒不算（隧道在握手、本来就没速度）
-#define RB_NODE_OK_MB        3.0        // 抹后跑出这么多 MB 就说明没限速，观测结束
+#define RB_NODE_OBS_ARM_SEC  60.0       // v78：抹后 60 秒才起算（8 秒时隧道还在握手，
+                                       // 那会儿算平均速率必然偏低）
+#define RB_NODE_OK_MB        60.0       // v78：抹后跑出 60MB 才判定「肯定没限速」。
+                                       // 原来 3MB 太低——挂机三分钟就能蹭到，会掩盖限速
 #define RB_NODE_WAIT_SEC     180.0      // 抹除后这么久内才做这个检测
-#define RB_NODE_ROTATE_MAX   3          // 一次抹除周期最多丢几次节点
+#define RB_NODE_ROTATE_MAX   2          // v78：一次抹除周期最多换两次节点
+#define RB_NODE_ROTATE_GAP   90.0       // v78：两次换节点至少隔这么久，别把隧道连着拆
 #define RB_NODE_WATCH_SEC    4.0        // 丢了之后每隔多久看一眼 App 有没有选出新节点
 #define RB_NODE_WATCH_MAX    40         // 最多看这么多次（40 x 4 秒 = 160 秒）
 #define RB_POST_WIPE_FALLBACK_SEC 25.0  // v73：抹后先等 App 自己重写节点文件；
@@ -2881,11 +2888,17 @@ static void rb_node_rotate(void) {
 
         NSMutableDictionary *st = rb_state();
 
-        [st removeObjectForKey:RB_NODEFILES_KEY];
-
+        // v78：原来这里连 RB_NODEFILES_KEY 一起清掉。现在不能清 ——
+        // 25 秒兜底要靠这份快照把节点文件写回来（没有节点文件时 provider 起来会卡
+        // 「连接中」）。快照只是「内容备份」，删的是磁盘上的文件，App 仍然会重选。
         [st removeObjectForKey:RB_PREFS_SNAP_KEY];
 
         rb_state_save(st);
+
+        // v78：gPostWipeWatchFired 是「这一轮已经有人拉过隧道」的记账。
+        // 换节点是新一轮，必须先清零，否则下面的兜底会误以为 watch 已经拉过而直接返回，
+        // 结果隧道停着没人拉 = 断网。
+        gPostWipeWatchFired = 0;
 
         if (n == 0) {
 
@@ -2907,10 +2920,31 @@ static void rb_node_rotate(void) {
         rb_stop_vpn();
 
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                     (int64_t)(RB_STOP_SETTLE_SEC * NSEC_PER_SEC)),
+                                     (int64_t)(RB_POST_WIPE_FALLBACK_SEC * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
 
-            @autoreleasepool { rb_start_vpn_once(0); }
+            // v78：原来这里是「等 STOP_SETTLE_SEC 秒就硬拉」，秒数太短 ——
+            // App 还没写完节点文件就拉起，provider 起来时没节点 → 卡「连接中」。
+            // 改成等 25 秒，让 watch（每 4 秒看一眼）先抓到 App 重写的新文件。
+            @autoreleasepool {
+
+                if (gPostWipeWatchFired) return;
+
+                // v78：App 25 秒都没重写，就把抹前快照原样写回再拉 ——
+                // 没节点文件拉起必然卡「连接中」，先保住能用。
+                if (rb_node_files_restore_raw()) {
+
+                    rb_log("换节点兜底：25 秒内 App 没重写节点文件，已写回快照再拉起");
+
+                } else {
+
+                    rb_log("换节点兜底：25 秒内 App 没重写节点文件，且没有可用快照 —— 只能先拉起");
+
+                }
+
+                rb_start_vpn_once(1);
+
+            }
 
         });
 
@@ -3721,7 +3755,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v77 节点导出\n"];
+        [out appendString:@"# rb-shim v79 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -5087,53 +5121,57 @@ static void rb_flow_tick(void) {
 
 #if RB_NODE_ROTATE_ON
 
-        // v67：抹除之后的节点体检。抹完 8 秒起算，连着 20 秒速率都上不去（<500 KB/s）
-        // 就判定「连的是旧节点/旧身份」→ 丢掉节点让 App 重新申请。
-        // 一旦真跑出 3MB 以上流量就说明没限速，观测结束不再打扰。
+        // v78：抹除之后的节点体检 —— 判据从「瞬时速率」改成「抹后平均速率」。
+        // rb-shim(19)：抹前同一节点 103.182.96.45 跑 8190 KB/s；
+        // 抹后 64 秒只跑 0.9 MB（平均 14 KB/s，瞬时 30.8 KB/s）。
+        // v77 已把「旧授权串被限速」证伪（App 重写的 f14.f2 / f22 与抹除前一字不差），
+        // 那就只剩「抹后第一次连的是哪个节点」这一个变量。
+        // 用户实测「自己在 App 里换一个节点就恢复正常」—— 这里把那一步自动化：
+        // 丢掉节点文件 + 停隧道，让 App 用新身份重走「拉列表 → 测速 → 选最优 → 写文件」，
+        // watch 一看到文件出现立刻拉起。
         {
             double lw = [[st objectForKey:@"lastWipeTs"] doubleValue];
-            static int rotN = 0, armed = 0;
-            static double obsStart = 0;
+            static int rotN = 0;
+            static double lastRot = 0;
+            static int done = 0;
 
-            if (lw <= 0 || now - lw > RB_NODE_WAIT_SEC) { rotN = 0; armed = 0; obsStart = 0; }
+            if (lw <= 0 || now - lw > RB_NODE_WAIT_SEC) {
 
-            else if (armed >= 0) {
+                rotN = 0; lastRot = 0; done = 0;
 
+            } else if (!done) {
+
+                double el = now - lw;
                 double accMB = (double)acc / 1048576.0;
+                double avg = (el > 1.0) ? (accMB * 1024.0 / el) : 0.0;   // 抹后平均 KB/s
 
                 if (accMB >= RB_NODE_OK_MB) {
 
-                    rb_log("节点体检：抹后已跑 %.1f MB，速率 %.1f KB/s —— 当前节点没被限速",
-                           accMB, gRateKBps);
-                    armed = -1;
+                    done = 1;
 
-                } else if (now - lw > RB_NODE_OBS_ARM_SEC) {
+                    rb_log("节点体检：抹后 %.0f 秒已跑 %.1f MB（平均 %.0f KB/s）"
+                           "—— 没被限速，观测结束", el, accMB, avg);
 
-                    if (obsStart <= 0) obsStart = now;
+                } else if (el >= RB_NODE_OBS_ARM_SEC && avg < RB_NODE_LIMIT_KBPS &&
+                           (lastRot <= 0 || now - lastRot >= RB_NODE_ROTATE_GAP)) {
 
-                    if (now - obsStart >= RB_NODE_OBS_SEC &&
-                        gRateKBps >= 0 && gRateKBps < RB_NODE_LIMIT_KBPS) {
+                    if (rotN < RB_NODE_ROTATE_MAX) {
 
-                        if (rotN < RB_NODE_ROTATE_MAX) {
+                        rotN++;
+                        lastRot = now;
 
-                            rotN++;
+                        rb_log("节点体检：抹后 %.0f 秒只跑 %.1f MB（平均 %.0f KB/s，"
+                               "正常 8000+）—— 自动换节点，等价于你手动切一次（第 %d/%d 次）",
+                               el, accMB, avg, rotN, RB_NODE_ROTATE_MAX);
 
-                            rb_log("节点体检：抹后 %.0f 秒速率只有 %.1f KB/s（正常 8000+）——"
-                                   "判定旧节点的旧认证串被限速，丢掉换新的（第 %d/%d 次）",
-                                   now - lw, gRateKBps, rotN, RB_NODE_ROTATE_MAX);
+                        rb_node_rotate();
 
-                            rb_node_rotate();
+                    } else {
 
-                            obsStart = now;
+                        done = 1;
 
-                        } else {
-
-                            armed = -1;
-
-                            rb_log("节点体检：连换 %d 次仍然限速 —— 剩下的要在 App 里手选一个新节点"
-                                   "（选中后 shim 会自动拉隧道）", RB_NODE_ROTATE_MAX);
-
-                        }
+                        rb_log("节点体检：自动换了 %d 次还是上不去 —— 剩下的得在 App 里手选节点"
+                               "（选中后 shim 会自动拉隧道）", RB_NODE_ROTATE_MAX);
 
                     }
 
@@ -7372,11 +7410,37 @@ static void rb_init(void) {
             //
             // 写回剥干净的版本：provider 起来时有 IP/端口/名称可用，不会卡连接中；
             // 但凭据和授权都没了，App 要么自己去 IssueNodeToken，要么连不上重试。
-            rb_log("这次是抹数据后启动：写回只含地址/端口/名称的节点文件（v77）—— "
-                   "凭据 f14.f2 和授权串 f22 都剥掉，App 必须自己去申请；"
-                   "不写回会踩 on-demand 抢跑卡「连接中」的老坑，所以照写");
+            // v79：不再写回旧节点文件。根因在 rb-req.txt 第 12 帧（#10 out/ff 370 字节）：
+            // 服务端给新身份推荐的节点是 f71 里那 4 个 —— 38.246.249.177(香港 61ms)、
+            // 23.129.140.69(首尔 66ms / 东京 66ms)、38.58.56.69(洛杉矶 166ms)；
+            // 而同一帧 f62 是我们实际连的 103.182.96.45，它压根不在推荐列表里。
+            // 旧节点文件把新身份钉在这个非推荐节点上 → 直接吃福利档 30 KB/s。
+            // 抹前同一 IP 能跑 8190 KB/s，说明节点本身没坏，是「新身份连非推荐节点」的问题。
+            // 手动切节点就是走这份推荐列表，所以只有手动切才恢复 —— 现在把这一步交给 App。
+            rb_log("这次是抹数据后启动：清空旧节点文件（v79）—— App 会从服务端推荐列表"
+                   "（38.246.249.177 香港 61ms 等）重新选，选中后 watch 自动拉起隧道");
 
-            rb_node_files_restore();
+            // 先关 on-demand：系统会在 App 写完节点文件之前就把 provider 拉起来，
+            // provider 起来时没有节点文件 → 永远卡「连接中」（v66 记过的老坑）。
+            // start 路径里会重新打开。
+            rb_set_ondemand(NO);
+
+            {
+                NSString *ndir = rb_node_dir();
+                NSFileManager *nfm = [NSFileManager defaultManager];
+                int dn = 0;
+
+                for (NSString *it in ([nfm contentsOfDirectoryAtPath:ndir error:NULL] ?: @[])) {
+
+                    if (!rb_is_node_file(it)) continue;
+
+                    if ([nfm removeItemAtPath:[ndir stringByAppendingPathComponent:it]
+                                        error:NULL]) dn++;
+
+                }
+
+                rb_log("抹后清空旧节点文件 %d 个（快照仍保留，45 秒兜底用）", dn);
+            }
 
             rb_prefs_restore();
 
@@ -7403,10 +7467,22 @@ static void rb_init(void) {
                     // 一样走安全网。
                     if (!cur || (gNodeWrote && [cur isEqualToData:gNodeWrote])) {
 
-                        rb_log("自检安全网：45 秒了 App 还没重新申请（文件还是剥版）"
-                               "—— 剥凭据这条路走不通，原样写回旧节点，先保住能连");
+                        // v79：抹后我们把节点文件清空了，正常情况下 App 会从服务端
+                        // 推荐列表重选并写回来。45 秒还没有 = 它没去选（可能进程没活）。
+                        // 写回快照并立刻拉起 —— 先保住能连，速度慢总比断网好。
+                        rb_log("自检安全网：45 秒了 App 还没选新节点 —— 写回快照并拉起隧道");
 
-                        rb_node_files_restore_raw();
+                        if (rb_node_files_restore_raw()) {
+
+                            rb_log("自检安全网：已写回旧节点文件（带凭据）");
+
+                        } else {
+
+                            rb_log("自检安全网：没有可用快照，只能直接拉起试试");
+
+                        }
+
+                        rb_start_vpn_once(1);
 
                     } else if (cur && gNodeWrote) {
 
@@ -7470,13 +7546,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v77 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v79 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v77 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v79 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
