@@ -6431,7 +6431,14 @@ uint64_t rely_transport_free_buffer(uint64_t a0, uint64_t a1, uint64_t a2, uint6
 
         size_t sz = malloc_size((const void *)(uintptr_t)a0);
 
-        if (sz >= 8 && sz <= RB_SCAN_MAX) rb_scan(a0, (uint64_t)sz, "fb");
+        // v77 自检：malloc_size() 返回的是分配块大小，不是数据实际长度 —— 尾部是
+        // 未初始化内存。v76 日志第 90 行「[fb] 侦测到额度归零（len=112）」就是
+        // 这么来的：112 是 malloc 块尺寸，真实数据更短，垃圾字节凑出了 protobuf
+        // 的额度字段，于是把一个刚建好的新身份判成「已用完」。
+        // 这里只留抓包取样，不再让它参与归零判定；归零走 cb 那条（真实指针 + 真实长度）。
+        if (sz >= 8 && sz <= RB_SCAN_MAX)
+
+            rb_trace_frame("in", "fb", a0, (uint64_t)sz);
 
     }
 
