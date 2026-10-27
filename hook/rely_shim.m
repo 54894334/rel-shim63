@@ -2369,9 +2369,14 @@ static NSData *rb_strip_auth(NSData *d) {
 
             f14sub = NULL;
 
+            int credBefore = credHits;   // v77 自检：解析失败要把计数退回去，
+                                        // 否则日志说「已去掉凭据」但其实原样保留了
+
             NSMutableData *kept = [NSMutableData dataWithCapacity:subN];
 
             NSUInteger j = 0;
+
+            BOOL subOk = YES;
 
             while (j < subN) {
 
@@ -2393,7 +2398,7 @@ static NSData *rb_strip_auth(NSData *d) {
 
                 }
 
-                if (s2 > 63) break;
+                if (s2 > 63) { subOk = NO; break; }
 
                 int f2 = (int)(k2 >> 3);
 
@@ -2417,9 +2422,9 @@ static NSData *rb_strip_auth(NSData *d) {
 
                     }
 
-                    if (s2 > 63) break;
+                    if (s2 > 63) { subOk = NO; break; }
 
-                    if (j + L2 > subN) break;
+                    if (j + L2 > subN) { subOk = NO; break; }
 
                     j += (NSUInteger)L2;
 
@@ -2437,11 +2442,11 @@ static NSData *rb_strip_auth(NSData *d) {
 
                     }
 
-                    if (s2 > 63) break;
+                    if (s2 > 63) { subOk = NO; break; }
 
                 } else {
 
-                    break;
+                    subOk = NO; break;
 
                 }
 
@@ -2451,7 +2456,16 @@ static NSData *rb_strip_auth(NSData *d) {
 
             }
 
-            if ([kept length] > 0 && [kept length] < 128) {
+            if (!subOk || ([kept length] == 0)) {
+
+                // v77 自检：子消息没解析完（或剥完为空）就原样保留整个 f14。
+                // 丢掉 f14 = 节点文件没有端口 = App 连不上，
+                // 宁可这次没剥掉，也不能产出个废文件。
+                credHits = credBefore;   // 这次实际没剥成功，计数退回去
+
+                [out appendBytes:(b + st) length:(i - st)];
+
+            } else if ([kept length] < 128) {
 
                 uint8_t kb = (uint8_t)(((uint64_t)14 << 3) | 2);
 
@@ -2465,7 +2479,7 @@ static NSData *rb_strip_auth(NSData *d) {
 
             } else {
 
-                credHits++;      // 子消息只剩空壳 → 整个 f14 丢掉
+                [out appendBytes:(b + st) length:(i - st)];   // 理论上不会发生
 
             }
 
@@ -6077,12 +6091,27 @@ static void rb_scan(uint64_t p, uint64_t len, const char *from) {
 
 static int gTraceN = 0;
 
+static double gTraceLast = 0;
+
 static void rb_trace_frame(const char *dir, const char *from,
                            uint64_t p, uint64_t len) {
 
     if (RB_TRACE_MAX <= 0 || gTraceN >= RB_TRACE_MAX) return;
 
-    if (!p || len < 8 || len > RB_SCAN_MAX) return;
+    // v77 自检：request 的 8 个参数只有部分是 (ptr,len)，其余是普通整数。
+    // arm64 用户态堆/栈地址都远大于 4G，低于这个值一定不是指针，
+    // 直接跳过，别让垃圾帧把 240 条配额占满。
+    if (p < 0x100000000ULL) return;
+
+    // v77 自检：只抓业务报文区间。太小的多是控制帧，太大的多是流量切片，
+    // 不筛的话 240 条配额几秒内就被数据面占满，IssueNodeToken 根本挤不进去。
+    if (len < 64 || len > 4096) return;
+
+    double nowT = rb_now();
+
+    if (nowT - gTraceLast < 0.02) return;      // 20ms 一帧，足够覆盖一次切节点
+
+    gTraceLast = nowT;
 
     uint8_t *tmp = (uint8_t *)malloc((size_t)len + 16);
 
@@ -6109,16 +6138,26 @@ static void rb_trace_frame(const char *dir, const char *from,
 
                           stringByAppendingPathComponent:@"Documents/rb-req.txt"];
 
-        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        // v77 自检：文件写大了就不再加，免得用户还要转发一个上百 KB 的文件。
+        // 注意这里不能直接 return —— 会跳过函数末尾的 free(tmp)，每次回调漏一块内存。
+        NSDictionary *fa = [[NSFileManager defaultManager]
+                            attributesOfItemAtPath:path error:NULL];
 
-        if (!fh) {
+        BOOL fileFull = (fa && [fa fileSize] > (512ULL * 1024));
+
+        if (fileFull) gTraceN = RB_TRACE_MAX;      // 直接关掉，不用每次都来判断
+
+        NSFileHandle *fh = fileFull ? nil
+                                    : [NSFileHandle fileHandleForWritingAtPath:path];
+
+        if (!fileFull && !fh) {
 
             [txt writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
 
             rb_log("报文抓取已开启：Documents/rb-req.txt（最多 %d 帧，请求+响应都抓）"
                    "—— 手动切一次节点，就能看到 IssueNodeToken 的原始报文", RB_TRACE_MAX);
 
-        } else {
+        } else if (fh) {
 
             [fh seekToEndOfFile];
 
@@ -7263,19 +7302,25 @@ static void rb_init(void) {
 
             // v70：照常写回节点文件（否则 App 一定弹节点选择页、要你手点），
             // 但写回时授权串已被作废 —— 有节点、无有效授权，让 App 用新身份重新签发。
-            // v77：不再预先写回节点文件。
-            // 写回哪个节点，App 就连哪个 —— 而我们的快照里永远是上一次连的那个。
-            // rb-shim(18) 抹后一直连新加坡 139.162.54.90（1588 KB/s），
-            // 用户手动切到香港才恢复。留空让 App 自己拉服务端列表按体验分选，
-            // 等于把手动切节点这一步程序化。
-            // 24 秒（6 × RB_NODE_WATCH_SEC）等不到，25 秒兜底再写回快照。
-            rb_log("这次是抹数据后启动：不写回节点文件（v77）—— "
-                   "交给 App 自己从服务端拉列表按体验分选，等效于自动切一次节点；"
-                   "%.0f 秒内没选上就写回快照兜底", (double)RB_POST_WIPE_FALLBACK_SEC);
+            // v77：写回，但用的是「剥掉凭据 f14.f2 + 授权串 f22」的版本。
+            //
+            // 为什么不能干脆不写回：rely_shim.m 下面那段 v66 的注释是踩过坑写下的——
+            // 「系统 on-demand 在 1 秒内就把隧道拉起了，provider 起来时节点文件还没
+            // 写回 → 永远卡「连接中」」。抹后留空就是把那个坑原封不动复活一次，
+            // 而且 App 还可能弹节点选择页。
+            //
+            // 写回剥干净的版本：provider 起来时有 IP/端口/名称可用，不会卡连接中；
+            // 但凭据和授权都没了，App 要么自己去 IssueNodeToken，要么连不上重试。
+            rb_log("这次是抹数据后启动：写回只含地址/端口/名称的节点文件（v77）—— "
+                   "凭据 f14.f2 和授权串 f22 都剥掉，App 必须自己去申请；"
+                   "不写回会踩 on-demand 抢跑卡「连接中」的老坑，所以照写");
+
+            rb_node_files_restore();
 
             rb_prefs_restore();
 
-            rb_node_watch_new(6);
+            // App 一旦自己重新申请并重写文件，立刻拉隧道
+            rb_node_watch_new(RB_NODE_WATCH_MAX);
 
         } else {
 
@@ -7445,14 +7490,9 @@ static void rb_init(void) {
 
                     } else {
 
-                        // v77：抹后没写回节点文件，这里先把快照补回去再拉起，
-                        // 否则隧道起来时没有节点文件，App 会停在节点选择页。
-                        rb_log("抹后兜底：%.0f 秒内 App 没选节点 —— 写回快照节点后再拉起",
+                        rb_log("抹后兜底：%.0f 秒内 App 没重写节点文件 —— 走正常自动重连",
+
                                (double)RB_POST_WIPE_FALLBACK_SEC);
-
-                        if (!rb_node_files_restore_direct())
-
-                            rb_log("抹后兜底：快照里没有节点文件，直接拉起（App 会自己选）");
 
                         rb_auto_start_vpn(0);
 
