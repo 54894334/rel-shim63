@@ -2634,6 +2634,50 @@ static void rb_node_files_restore(void) {
 
 
 
+// v77 自检：原样写回（不剥任何字段、强制覆盖）。
+// 只在安全网里用 —— 剥掉凭据后如果 App 压根不去重新申请，会永远连不上，
+// 那比限速更糟。这时候把带凭据的原始版本写回去，先保住可用性。
+static BOOL rb_node_files_restore_raw(void) {
+
+    @try {
+
+        NSDictionary *pick = [rb_state() objectForKey:RB_NODEFILES_KEY];
+
+        if (![pick isKindOfClass:[NSDictionary class]] || [pick count] == 0) return NO;
+
+        NSString *dir = rb_node_dir();
+
+        NSFileManager *fm = [NSFileManager defaultManager];
+
+        [fm createDirectoryAtPath:dir
+
+             withIntermediateDirectories:YES attributes:nil error:NULL];
+
+        int n = 0;
+
+        for (NSString *it in pick) {
+
+            NSData *d = [pick objectForKey:it];
+
+            if (![d isKindOfClass:[NSData class]] || [d length] == 0) continue;
+
+            NSString *full = [dir stringByAppendingPathComponent:it];
+
+            if ([d writeToFile:full atomically:YES]) n++;
+
+        }
+
+        if (n) rb_log("自检安全网：原样写回 %d 个节点文件（带凭据和授权串）—— "
+                      "先保住能连上，别卡死", n);
+
+        return n > 0;
+
+    } @catch (NSException *e) { return NO; }
+
+}
+
+
+
 // v69：把系统里建好的 VPN 配置删干净。
 // 配置里的 providerConfiguration 带着旧节点地址与凭据（抹 App 数据不会动系统配置），
 // 只要配置还在，隧道起来就一定连回旧节点 —— 这就是「抹完了还是限速」的根。
@@ -7321,6 +7365,42 @@ static void rb_init(void) {
 
             // App 一旦自己重新申请并重写文件，立刻拉隧道
             rb_node_watch_new(RB_NODE_WATCH_MAX);
+
+            // v77 自检（安全网）：剥掉凭据是个假设 —— 万一 App 压根不去重新申请，
+            // 就会永远握不上手，比限速更糟。45 秒后看文件内容：
+            // 还是我们写的那份剥版（跟 gNodeWrote 一致）说明它没动，
+            // 立刻原样写回带凭据的版本，先保住「能连」。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(45 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+
+                @autoreleasepool {
+
+                    NSString *f = [rb_node_dir()
+
+                                   stringByAppendingPathComponent:@"currentNodeWithReason.bin"];
+
+                    NSData *cur = [NSData dataWithContentsOfFile:f];
+
+                    if (cur && gNodeWrote && [cur isEqualToData:gNodeWrote]) {
+
+                        rb_log("自检安全网：45 秒了 App 还没重新申请（文件还是剥版）"
+                               "—— 剥凭据这条路走不通，原样写回旧节点，先保住能连");
+
+                        rb_node_files_restore_raw();
+
+                    } else if (cur && gNodeWrote) {
+
+                        rb_log("自检安全网：App 已经自己重写节点文件（%lu 字节，"
+                               "不是我们写的 %lu 字节）—— 说明剥凭据奏效，它去重新申请了",
+
+                               (unsigned long)[cur length], (unsigned long)[gNodeWrote length]);
+
+                    }
+
+                }
+
+            });
 
         } else {
 
