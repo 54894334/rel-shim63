@@ -7708,12 +7708,22 @@ static void rb_heal_tick(void) {
 
             int vs = rb_vpn_status();
             BOOL wet = (gLastTrafficTs > 0 && rb_now() - gLastTrafficTs < 30.0);
+            double rate = gRateKBps;
 
-            if (vs == 3 && wet) {
-                rb_log("[HEAL] ✅ 连上了：第 %d 级之后状态 3 且有流量，速率 %.1f KB/s —— "
-                       "这一级就是有效的那条路", gHealStep, gRateKBps);
+            // 连上且速率正常 = 真成功。只看「有没有流量」会误判：刚连上还没跑数据
+            // 的时候也是 0，把健康的隧道又拆一次，纯浪费时间。
+            if (vs == 3 && rate >= 150.0) {
+                rb_log("[HEAL] ✅ 连上了：第 %d 级之后状态 3，速率 %.1f KB/s —— "
+                       "这一级就是有效的那条路", gHealStep, rate);
                 gHealDone = 1;
                 return;
+            }
+
+            if (vs == 3) {
+                rb_log("[HEAL] 第 %d 级后状态 3 但速率只有 %.1f KB/s（有流量=%d）—— "
+                       "连上了但被限速，继续下一级", gHealStep, rate, wet ? 1 : 0);
+            } else {
+                rb_log("[HEAL] 第 %d 级后状态 %d（没连上），继续下一级", gHealStep, vs);
             }
 
             if (gHealStep >= 5) {
