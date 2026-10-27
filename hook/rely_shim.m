@@ -236,6 +236,8 @@
 #define RB_NODE_ROTATE_MAX   3          // 一次抹除周期最多丢几次节点
 #define RB_NODE_WATCH_SEC    4.0        // 丢了之后每隔多久看一眼 App 有没有选出新节点
 #define RB_NODE_WATCH_MAX    40         // 最多看这么多次（40 x 4 秒 = 160 秒）
+#define RB_POST_WIPE_FALLBACK_SEC 25.0  // v73：抹后先等 App 自己重写节点文件；
+                                       // 等这么久它还没动静，才退回正常自动重连
 
 
 
@@ -1012,7 +1014,24 @@ static void rb_probe_auth(const uint8_t *b, size_t n) {
 
                          done, (unsigned long)n, ms];
 
-        [txt writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+        // v73：原来每份都覆盖同一个文件 —— rb-shim(15) 里 139 字节（高速时抓到的）
+        // 和 253 字节（额度心跳）都被最后那份 210 字节冲掉了，只剩低速那一份，
+        // 根本没法跟高速那份对比。改成追加：第一次写覆盖、之后追加。
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
+
+        if (done == 1 || !fh) {
+
+            [txt writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+
+        } else {
+
+            [fh seekToEndOfFile];
+
+            [fh writeData:[txt dataUsingEncoding:NSUTF8StringEncoding]];
+
+            [fh closeFile];
+
+        }
 
         rb_log("抓到疑似节点授权报文（第 %d 份，%lu 字节，含凭据+授权串）—— "
                "已存 Documents/rb-auth-sample.txt，下一版据此自动重放", done, (unsigned long)n);
@@ -1471,6 +1490,73 @@ static void rb_collect_vpn_kc(void) {
 // 前面几次都抹了还是归零，说明「VPN 配置引用项」里也带身份，那就别再留了 ——
 
 // 代价是 VPN 配置可能失效（手动重新连一次即可），换来的是额度真的刷新。
+
+// v73：只读导出 keychain 清单（service / account / 类 / 可访问组），不动任何一项。
+static void rb_kc_dump(void) {
+
+    NSArray *classes = [NSArray arrayWithObjects:
+
+                        (id)kSecClassGenericPassword, (id)kSecClassInternetPassword,
+
+                        (id)kSecClassCertificate, (id)kSecClassKey,
+
+                        (id)kSecClassIdentity, nil];
+
+    NSMutableString *ms = [NSMutableString string];
+
+    int total = 0;
+
+    for (id cls in classes) {
+
+        NSDictionary *q = [NSDictionary dictionaryWithObjectsAndKeys:
+
+                           cls,                    (id)kSecClass,
+
+                           (id)kSecMatchLimitAll,  (id)kSecMatchLimit,
+
+                           (id)kCFBooleanTrue,     (id)kSecReturnAttributes,
+
+                           nil];
+
+        CFTypeRef raw = NULL;
+
+        if (SecItemCopyMatching((CFDictionaryRef)q, &raw) != errSecSuccess || raw == NULL) continue;
+
+        id obj = [(id)raw autorelease];
+
+        if (![obj isKindOfClass:[NSArray class]]) continue;
+
+        for (NSDictionary *it in (NSArray *)obj) {
+
+            [ms appendFormat:@"class=%@ svc=%@ acct=%@ agrp=%@\n",
+
+             cls,
+
+             [it objectForKey:(id)kSecAttrService]  ?: @"(nil)",
+
+             [it objectForKey:(id)kSecAttrAccount]  ?: @"(nil)",
+
+             [it objectForKey:(id)kSecAttrAccessGroup] ?: @"(nil)"];
+
+            total++;
+
+        }
+
+    }
+
+    NSString *fp = [NSHomeDirectory()
+
+                    stringByAppendingPathComponent:@"Documents/rb-kc.txt"];
+
+    NSString *txt = [NSString stringWithFormat:@"# v73 keychain 清单（只读，%d 项）\n%@", total, ms];
+
+    [txt writeToFile:fp atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+
+    rb_log("keychain 清单：%d 项已导出 Documents/rb-kc.txt（只读，不动任何一项）", total);
+
+}
+
+
 
 static int rb_kc_wipe(int aggressive) {
 
@@ -2243,6 +2329,7 @@ static void rb_node_hex_dump(NSData *d, NSString *name) {
 static void rb_node_files_restore(void);   // v68 前向声明（下面的 _direct 要用）
 
 static NSData *gNodeWrote = nil;           // v71：我们最后一次写回的节点文件内容
+static int  gPostWipeWatchFired = 0;       // v73：watch 已经替 App 拉过隧道了
 
 // 不论是不是刚抹完、都真的写一次（bounce 兜底用）
 static BOOL rb_node_files_restore_direct(void) {
@@ -2635,6 +2722,8 @@ static void rb_node_watch_new(int left) {
 
                 rb_state_save(st);
 
+                gPostWipeWatchFired = 1;   // v73：告诉兜底别再插一手
+
                 rb_start_vpn_once(1);
 
                 return;
@@ -2722,6 +2811,11 @@ static int rb_wipe_all(void) {
     } @catch (NSException *e) { }
 
 
+
+    // v73：抹之前先把 keychain 全清单导出来（只读）。
+    // 找的是「哪一项决定额度刷新、哪一项决定速度档位」—— 只有 1 项会被删，
+    // 而 160Kbps 正好对上 Dart 里的 ISSUE_NODE_TOKEN_LICENSE_NOT_FOUND / EXPIRED。
+    @try { rb_kc_dump(); } @catch (NSException *e) { }
 
     int nk = 0;
 
@@ -3362,7 +3456,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v72 节点导出\n"];
+        [out appendString:@"# rb-shim v73 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -6884,13 +6978,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v72 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v73 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v72 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v73 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
@@ -6986,7 +7080,34 @@ static void rb_init(void) {
 
 #if RB_AUTO_RECONNECT
 
-            rb_auto_start_vpn(0);
+            // v73：rb-shim(15) 第 58 行（我们抢先 startVPNTunnel）早于第 59 行
+            // （App 才把节点文件从 280 字节补成带授权串的 319 字节）—— 隧道拿
+            // 「没有授权串」的那份文件起，服务端按无授权压到 160Kbps 档，这就是
+            // 抹完只剩 21.2 KB/s 的直接原因（同一个节点抹除前能跑 4931 KB/s）。
+            // 抹完之后先等 App 自己重写完（rb_node_watch_new 盯着），等不到再兜底。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(RB_POST_WIPE_FALLBACK_SEC * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+
+                @autoreleasepool {
+
+                    if (gPostWipeWatchFired) {
+
+                        rb_log("抹后流程：App 已自己重写节点文件并由 watch 拉起隧道，兜底不动手");
+
+                    } else {
+
+                        rb_log("抹后兜底：%.0f 秒内 App 没重写节点文件 —— 走正常自动重连",
+
+                               (double)RB_POST_WIPE_FALLBACK_SEC);
+
+                        rb_auto_start_vpn(0);
+
+                    }
+
+                }
+
+            });
 
 #endif
 
