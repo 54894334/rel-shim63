@@ -2266,6 +2266,8 @@ static NSData *rb_strip_auth(NSData *d) {
     int hits = 0;
 
     int credHits = 0;      // v77：被剥掉的节点凭据 f14.f2 个数
+    const uint8_t *f14sub = NULL;
+    NSUInteger f14n = 0;
 
     while (i < n) {
 
@@ -2315,6 +2317,8 @@ static NSData *rb_strip_auth(NSData *d) {
 
             if (i + L > n) break;
 
+            if (field == 14 && L > 0) { f14sub = b + i; f14n = (NSUInteger)L; }
+
             i += (NSUInteger)L;
 
         } else if (wt == 0) {
@@ -2358,10 +2362,12 @@ static NSData *rb_strip_auth(NSData *d) {
         // 正好 +39 字节 = f22 编码长度，证明它只补授权、不重新申请）。
         // 凭据留着 = 服务端认出旧节点会话 = 按已用满 300MB 压 160Kbps。
         // v65 唯一一次 8312.3 KB/s，写回的节点文件正是 76 字节（无 f22、无 f14.f2）。
-        if (field == 14 && wt == 2 && L > 0) {
+        if (field == 14 && f14sub && f14n > 0) {
 
-            const uint8_t *sub = b + i;
-            NSUInteger subN = (NSUInteger)L;
+            const uint8_t *sub = f14sub;
+            NSUInteger subN = f14n;
+
+            f14sub = NULL;
 
             NSMutableData *kept = [NSMutableData dataWithCapacity:subN];
 
@@ -2462,8 +2468,6 @@ static NSData *rb_strip_auth(NSData *d) {
                 credHits++;      // 子消息只剩空壳 → 整个 f14 丢掉
 
             }
-
-            i += (NSUInteger)L;
 
             continue;
 
@@ -6062,6 +6066,76 @@ static void rb_scan(uint64_t p, uint64_t len, const char *from) {
 
 
 
+// v77：无条件抓 transport 收发的每一个帧。
+// 原来的 rb_probe_auth 要求「同一个包里同时有大写 36hex 和小写 36hex」——
+// 但授权请求里只有节点凭据（大写），授权串是小写、在响应里，两者不在同一个包，
+// 所以七份日志一次都没命中，抓到的全是 f1=35 的流量上报。
+// 这里改成不判内容、全部落盘：用户手动切一次节点，就能看到 IssueNodeToken
+// 的请求和响应，下一轮据此重放。
+#define RB_TRACE_MAX   240       // 最多抓多少帧（0 = 关闭）
+#define RB_TRACE_BYTES 400       // 每帧最多 dump 多少字节
+
+static int gTraceN = 0;
+
+static void rb_trace_frame(const char *dir, const char *from,
+                           uint64_t p, uint64_t len) {
+
+    if (RB_TRACE_MAX <= 0 || gTraceN >= RB_TRACE_MAX) return;
+
+    if (!p || len < 8 || len > RB_SCAN_MAX) return;
+
+    uint8_t *tmp = (uint8_t *)malloc((size_t)len + 16);
+
+    if (!tmp) return;
+
+    size_t got = rb_read((const void *)(uintptr_t)p, tmp, (size_t)len);
+
+    if (got < 8) { free(tmp); return; }
+
+    @autoreleasepool {
+
+        gTraceN++;
+
+        NSMutableString *ms = [NSMutableString string];
+
+        NSUInteger lim = got < (size_t)RB_TRACE_BYTES ? got : (NSUInteger)RB_TRACE_BYTES;
+
+        for (NSUInteger i = 0; i < lim; i++) [ms appendFormat:@"%02x", tmp[i]];
+
+        NSString *txt = [NSString stringWithFormat:@"#%d %s/%s len=%lu\n%@\n",
+                         gTraceN, dir, from, (unsigned long)got, ms];
+
+        NSString *path = [NSHomeDirectory()
+
+                          stringByAppendingPathComponent:@"Documents/rb-req.txt"];
+
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+
+        if (!fh) {
+
+            [txt writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+
+            rb_log("报文抓取已开启：Documents/rb-req.txt（最多 %d 帧，请求+响应都抓）"
+                   "—— 手动切一次节点，就能看到 IssueNodeToken 的原始报文", RB_TRACE_MAX);
+
+        } else {
+
+            [fh seekToEndOfFile];
+
+            [fh writeData:[txt dataUsingEncoding:NSUTF8StringEncoding]];
+
+            [fh closeFile];
+
+        }
+
+    }
+
+    free(tmp);
+
+}
+
+
+
 #pragma mark - 原实现转发（8 个导出）
 
 
@@ -6126,7 +6200,13 @@ static uint64_t rb_cb_dispatch(int slot, uint64_t a0, uint64_t a1, uint64_t a2,
 
             uint64_t p = v[i], L = v[i + 1];
 
-            if (L >= 8 && L <= RB_SCAN_MAX) rb_scan(p, L, "cb");
+            if (L >= 8 && L <= RB_SCAN_MAX) {
+
+                rb_scan(p, L, "cb");
+
+                rb_trace_frame("in", "cb", p, L);      // v77：入站帧原样抓
+
+            }
 
         }
 
@@ -6220,6 +6300,15 @@ uint64_t rely_transport_request(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t 
                                 uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7) {
 
     if (!gRequest) return (uint64_t)-1;
+
+    // v77：出站帧也抓。IssueNodeToken 走的就是这个接口，之前完全没留痕。
+    @autoreleasepool {
+
+        uint64_t v[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
+
+        for (int i = 0; i + 1 < 8; i++) rb_trace_frame("out", "request", v[i], v[i + 1]);
+
+    }
 
     return gRequest(a0, a1, a2, a3, a4, a5, a6, a7);
 
