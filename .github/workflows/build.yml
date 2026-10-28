@@ -32,3 +32,36 @@ jobs:
         with:
           name: rely_transport
           path: rely_transport
+
+      # v86：插件版 —— 独立 dylib，TrollFools / 巨魔注入器直接注进主 App。
+      # 不替换 rely_transport.framework，也不碰 appex，装一次就能用。
+      - name: Build plugin dylib
+        run: |
+          set -euo pipefail
+          xcrun -sdk iphoneos clang \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -dynamiclib \
+            -fobjc-exceptions \
+            -Os \
+            -DRB_PLUGIN=1 \
+            -install_name @executable_path/Frameworks/RelyWipe.dylib \
+            -o RelyWipe.dylib \
+            hook/rely_shim.m \
+            -framework Foundation \
+            -framework CoreGraphics \
+            -framework UIKit \
+            -framework AVFoundation \
+            -framework Security
+          codesign -s - --force RelyWipe.dylib
+          ls -l RelyWipe.dylib
+          xcrun -sdk iphoneos otool -D RelyWipe.dylib | tail -1
+      - name: 插件自检
+        run: |
+          set -euo pipefail
+          test "$(xcrun -sdk iphoneos otool -D RelyWipe.dylib | tail -1)" = "@executable_path/Frameworks/RelyWipe.dylib"
+          python3 hook/check_plugin.py RelyWipe.dylib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RelyWipePlugin
+          path: RelyWipe.dylib
