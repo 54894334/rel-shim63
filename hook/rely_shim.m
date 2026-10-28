@@ -8682,6 +8682,8 @@ static void rb_init(void) {
 
 
 
+        rb_log("RB83B2 标记：捕获模块已编入本版");
+
         if (!load_orig()) rb_log("原实现加载失败，App 可能连不上");
 
         // v83：2 秒后挂「抓 App 启动参数」的钩子（NetworkExtension 可能还没加载）
