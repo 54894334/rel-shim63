@@ -60,7 +60,8 @@ jobs:
         run: |
           set -euo pipefail
           test "$(xcrun -sdk iphoneos otool -D RelyWipe.dylib | tail -1)" = "@executable_path/Frameworks/RelyWipe.dylib"
-          python3 hook/check_plugin.py RelyWipe.dylib
+          xcrun -sdk iphoneos nm -gU RelyWipe.dylib | awk '{print $NF}' | sort > syms.txt
+          python3 hook/check_plugin.py RelyWipe.dylib syms.txt
       - uses: actions/upload-artifact@v4
         with:
           name: RelyWipePlugin
