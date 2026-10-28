@@ -173,7 +173,7 @@
 
 // 速率才是抓「已经被限速」的那条。
 
-#define RB_THROTTLE_DETECT   1        // 1=检测到被限速就抹
+#define RB_THROTTLE_DETECT   0        // v85：关掉「限速就抹」，只在额度归零时抹
 
 #define RB_THROTTLE_KBPS     40.0     // 速率持续低于这个值（KB/s）才算被限速
 
@@ -288,7 +288,7 @@
 
 #define RB_RELAUNCH         1        // 抹完自拉起 App
 
-#define RB_AUTO_RECONNECT   1        // 新进程自动连回 VPN
+#define RB_AUTO_RECONNECT   0        // v85：关掉自动重连（只保留归零→抹数据→自拉起）
 
 #define RB_RECONNECT_TRIES  6        // 自动重连最多试这么多次（每次间隔 2.5 秒）
 
@@ -330,14 +330,14 @@
 
 #define RB_AUTO_CONNECT      1        // 开关的默认值（改过之后会记住）
 
-#define RB_KEEPALIVE         1        // 开关打开时盯场：状态不对就重新拉起
+#define RB_KEEPALIVE         0        // v85：关掉盯场保活
 
 #define RB_KEEPALIVE_SEC     12.0     // 盯场间隔（秒）
 #define RB_POST_WIPE_QUIET   25.0     // v74：抹后多少秒内不抢先拉隧道
 
 #define RB_RECONNECT_GAP     20.0     // 两次真实 start 之间的最小间隔，防止打太密
 
-#define RB_ONDEMAND_CONNECT  1        // 开「自动连接」时给配置装上 on-demand 常连规则
+#define RB_ONDEMAND_CONNECT  0        // v85：不装 on-demand 常连规则
 
                                       // （这是 iOS 系统级常连，App 被挂起也照样重连）
 
@@ -3160,12 +3160,6 @@ static int rb_wipe_all(void) {
 
     double t0 = rb_now();
 
-    // v81：先把「抹之前」的现场全量存一份 —— 只盯节点文件不够，
-    // 旧凭据被 App 记在别处才会出现「抹完自己长回来」这种事。
-    @try { rb_full_dump("抹除前"); } @catch (NSException *e) { }
-
-
-
     NSArray *keepState = [NSArray arrayWithObjects:RB_STATE_FILE, RB_PREFS_FILE, nil];
 
     NSArray *keepDoc   = [NSArray arrayWithObjects:RB_LOG_NAME, nil];
@@ -3292,10 +3286,6 @@ static int rb_wipe_all(void) {
     // 配置留着：节点选择、隧道参数都在，只是不碰它。
 
 
-
-    // v84：抹除会连 App Group 一起清，所以清完把 App 的启动参数重新放回去 ——
-    // 新进程（抹后自拉起）要靠它去带参数拉隧道，否则 provider 节点永远为空。
-    @try { rb_cap_save_opts_group(); } @catch (NSException *e) { }
 
     rb_log("抹数据完成：删掉 %d 个文件/目录，keychain %d 项，耗时 %.2fs",
 
@@ -6471,7 +6461,7 @@ static void rb_fire(const char *why, BOOL force) {
 
         // 熔断/闪退循环时采样链与定时器链都已停摆，这里重新拉起来
 
-        if (was) { rb_flow_tick(); rb_tick(); rb_keepalive_boot(); }
+        if (was) { rb_flow_tick(); rb_tick(); }
 
     } else {
 
@@ -6780,7 +6770,7 @@ static void rb_scan(uint64_t p, uint64_t len, const char *from) {
 // 所以七份日志一次都没命中，抓到的全是 f1=35 的流量上报。
 // 这里改成不判内容、全部落盘：用户手动切一次节点，就能看到 IssueNodeToken
 // 的请求和响应，下一轮据此重放。
-#define RB_TRACE_MAX   240       // 最多抓多少帧（0 = 关闭）
+#define RB_TRACE_MAX   0         // v85：关掉抓包
 #define RB_TRACE_BYTES 400       // 每帧最多 dump 多少字节
 
 static int gTraceN = 0;
@@ -7436,7 +7426,7 @@ static void rb_panel_set_expanded(int on);   // 定义在 RbPanelVC 之后
 
     // —— 展开后的完整面板 ——
 
-    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 330, 334)];
+    UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 330, 176)];
 
     v.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.94];
 
@@ -7452,7 +7442,7 @@ static void rb_panel_set_expanded(int on);   // 定义在 RbPanelVC 之后
 
 
 
-    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 10, 300, 132)];
+    UILabel *lbl = [[UILabel alloc] initWithFrame:CGRectMake(12, 10, 300, 96)];
 
     lbl.textColor = [UIColor whiteColor];
 
@@ -7470,39 +7460,9 @@ static void rb_panel_set_expanded(int on);   // 定义在 RbPanelVC 之后
 
 
 
-    // 「自动连接」开关：开 = 一直保持连接（断了自动拉起，抹完自动接回）；
-
-    // 关 = 立刻断开并且再也不自动连。不用再去点 App 里那个连接按钮。
-
-    UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectMake(12, 146, 51, 31)];
-
-    sw.on = rb_auto_on() ? YES : NO;
-
-    [sw addTarget:self action:@selector(rbAuto:) forControlEvents:UIControlEventValueChanged];
-
-    [v addSubview:sw];
-
-    [sw release];
-
-
-
-    UILabel *sl = [[UILabel alloc] initWithFrame:CGRectMake(72, 146, 200, 31)];
-
-    sl.text = @"自动连接（开=常连，关=断开不用）";
-
-    sl.textColor = [UIColor colorWithRed:0.6 green:1.0 blue:0.6 alpha:1];
-
-    sl.font = [UIFont systemFontOfSize:11];
-
-    [v addSubview:sl];
-
-    [sl release];
-
-
-
     UIButton *b1 = [UIButton buttonWithType:UIButtonTypeSystem];
 
-    b1.frame = CGRectMake(12, 184, 132, 32);
+    b1.frame = CGRectMake(12, 118, 306, 40);
 
     b1.backgroundColor = [UIColor colorWithRed:0.85 green:0.2 blue:0.2 alpha:1];
 
@@ -7515,97 +7475,6 @@ static void rb_panel_set_expanded(int on);   // 定义在 RbPanelVC 之后
     [b1 addTarget:self action:@selector(rbWipe:) forControlEvents:UIControlEventTouchUpInside];
 
     [v addSubview:b1];
-
-
-
-    UIButton *b2 = [UIButton buttonWithType:UIButtonTypeSystem];
-
-    b2.frame = CGRectMake(150, 184, 62, 32);
-
-    b2.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1];
-
-    [b2 setTitle:@"重连" forState:UIControlStateNormal];
-
-    [b2 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-
-    b2.titleLabel.font = [UIFont systemFontOfSize:12];
-
-    [b2 addTarget:self action:@selector(rbReconn:) forControlEvents:UIControlEventTouchUpInside];
-
-    [v addSubview:b2];
-
-
-
-    UIButton *b3 = [UIButton buttonWithType:UIButtonTypeSystem];
-
-    b3.frame = CGRectMake(218, 184, 48, 32);
-
-    b3.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1];
-
-    [b3 setTitle:@"刷新" forState:UIControlStateNormal];
-
-    [b3 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-
-    b3.titleLabel.font = [UIFont systemFontOfSize:12];
-
-    [b3 addTarget:self action:@selector(rbRefresh:) forControlEvents:UIControlEventTouchUpInside];
-
-    [v addSubview:b3];
-
-
-
-    UIButton *b4 = [UIButton buttonWithType:UIButtonTypeSystem];
-
-    b4.frame = CGRectMake(272, 184, 46, 32);
-
-    b4.backgroundColor = [UIColor colorWithWhite:0.3 alpha:1];
-
-    [b4 setTitle:@"收起" forState:UIControlStateNormal];
-
-    [b4 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-
-    b4.titleLabel.font = [UIFont systemFontOfSize:12];
-
-    [b4 addTarget:self action:@selector(rbCollapse:) forControlEvents:UIControlEventTouchUpInside];
-
-    [v addSubview:b4];
-
-    UIButton *b5 = [UIButton buttonWithType:UIButtonTypeSystem];
-    b5.frame = CGRectMake(12, 222, 306, 30);
-    b5.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1];
-    [b5 setTitle:@"导出节点信息" forState:UIControlStateNormal];
-    [b5 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    b5.titleLabel.font = [UIFont systemFontOfSize:12];
-    [b5 addTarget:self action:@selector(rbExport:) forControlEvents:UIControlEventTouchUpInside];
-    [v addSubview:b5];
-
-    UIButton *b6 = [UIButton buttonWithType:UIButtonTypeSystem];
-    b6.frame = CGRectMake(12, 258, 150, 30);
-    b6.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1];
-    [b6 setTitle:@"节点测速" forState:UIControlStateNormal];
-    [b6 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    b6.titleLabel.font = [UIFont systemFontOfSize:12];
-    [b6 addTarget:self action:@selector(rbSpeed:) forControlEvents:UIControlEventTouchUpInside];
-    [v addSubview:b6];
-
-    UIButton *b7 = [UIButton buttonWithType:UIButtonTypeSystem];
-    b7.frame = CGRectMake(168, 258, 150, 30);
-    b7.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1];
-    [b7 setTitle:@"导出配置键" forState:UIControlStateNormal];
-    [b7 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    b7.titleLabel.font = [UIFont systemFontOfSize:12];
-    [b7 addTarget:self action:@selector(rbPrefs:) forControlEvents:UIControlEventTouchUpInside];
-
-    [v addSubview:b7];
-
-    UIButton *b8 = [UIButton buttonWithType:UIButtonTypeSystem];
-    b8.frame = CGRectMake(12, 294, 306, 30);
-    b8.backgroundColor = [UIColor colorWithWhite:0.25 alpha:1];
-    [b8 setTitle:@"换节点（丢旧节点重申请）" forState:UIControlStateNormal];
-    [b8 setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    b8.titleLabel.font = [UIFont systemFontOfSize:12];
-    [b8 addTarget:self action:@selector(rbNodeRot:) forControlEvents:UIControlEventTouchUpInside];
-    [v addSubview:b8];
 
 
 
@@ -7698,7 +7567,7 @@ static void rb_panel_set_expanded(int on) {
 
         if (on) {
 
-            fr = CGRectMake(8, top, wdt, 334);
+            fr = CGRectMake(8, top, wdt, 176);
 
         } else {
 
@@ -8814,18 +8683,11 @@ static void rb_init(void) {
             // v81：写回「原版」（带旧凭据）—— v80 写剥版的结果是 App 4 秒内自己就把
             // 旧凭据补回去了（日志「检测到 App 已选中新节点（319 字节）」），剥了等于白剥，
             // 还白多一次重写。磁盘上有文件，provider 起来才不会卡在「正在连接」。
-            rb_log("这次是抹数据后启动（v81）：写回原版节点文件，拉一次，之后不再拆隧道");
+            rb_log("这次是抹数据后启动（v85）：写回节点文件，不再自动拉隧道 —— 打开 App 手动点连接即可");
 
             rb_node_files_restore_raw();
 
             rb_prefs_restore();
-
-            // App 一旦自己重写文件（真去申请了新凭据），立刻拉起隧道
-            rb_node_watch_new(RB_NODE_WATCH_MAX);
-
-            // v81：抹完 RB_AUTOTAP_DELAY 秒开始自动点节点 ——
-            // 节点凭据只能由 App 自己 IssueNodeToken 签发，而那请求只在「点节点」时发。
-            rb_autotap_boot();
 
         } else {
 
@@ -8876,15 +8738,15 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v83 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v85 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v84 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v85 精简版已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
-                   "流量阈值 %.0f MB）",
+                   "额度阈值 %.0f MB）—— 只保留：归零→抹数据→自拉起，不自动重连",
 
                    (int)getpid(), [[st objectForKey:@"wipeCount"] intValue], bct,
 
@@ -8896,17 +8758,7 @@ static void rb_init(void) {
 
 
 
-        rb_log("RB83B2 标记：捕获模块已编入本版");
-
         if (!load_orig()) rb_log("原实现加载失败，App 可能连不上");
-
-        // v83：2 秒后挂「抓 App 启动参数」的钩子（NetworkExtension 可能还没加载）
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            @autoreleasepool { @try { rb_cap_install(); } @catch (NSException *e) { } }
-        });
-
-
 
         // v55：快速通道不再只认 pendingStart。上次抹除之后还没稳定跑满
 
@@ -8959,18 +8811,6 @@ static void rb_init(void) {
             rb_log("抹除后重开：进入快速通道（宽限 %.0fs / 冷却 %.0fs），即将自动重连",
 
                    (double)RB_GRACE_FAST_SEC, (double)RB_COOL_FAST_SEC);
-
-            // v81：自愈阶梯整体停用（RB_HEAL_ON=0）—— rb-shim(21) 里它把隧道
-            // stop/start 了七八次，最后连「自动连接开关」都切到关，界面永远「正在连接」。
-            rb_heal_boot();
-
-            // v81：抹后 12 秒把「App 重新长回来的东西」全量导一份，
-            // 看旧节点凭据到底从哪个文件 / keychain 项复活的。
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                         (int64_t)(12 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                @autoreleasepool { rb_full_dump("抹后可恢复现场"); }
-            });
 
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
 
@@ -9081,26 +8921,6 @@ static void rb_init(void) {
 
         rb_tick();
 
-        rb_keepalive_boot();
-
-        // v82：同理 —— 抹后自拉起这一趟，开关关着也要把隧道拉起来
-        if (rb_auto_on()) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            @autoreleasepool { if (!rb_just_wiped()) { rb_node_files_restore(); rb_prefs_restore(); }
-                               rb_prefs_dump(); rb_export_nodes(); }
-        });
-
-        // v82：去掉启动 28 秒那次测速。节点是 QUIC(UDP/443)，这里拿 TCP 443 去握手，
-        // 结果永远是「全部连不上」（v81 日志第 64 行），测了没意义还把界面拖住。
-
-            // 开着常连：进来就保证隧道是连着的（on-demand 装在 4 秒后，start 在 6 秒后）
-
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
-
-                           dispatch_get_main_queue(), ^{ rb_start_vpn_once(0); });
-
-        }
 
     });
 
