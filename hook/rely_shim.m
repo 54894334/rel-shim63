@@ -67,6 +67,7 @@
 #import <os/log.h>
 
 #import <mach/mach.h>
+#include <mach/mach_vm.h>   // v82：mach_vm_write（改出站报文用，失败也不崩）
 
 #import <objc/runtime.h>
 
@@ -124,7 +125,7 @@
 
 #define RB_MAX_BOOT_LOOP    6        // 12 秒内重启这么多次 → 判定为闪退循环，停用
 
-#define RB_WIPE_THRESHOLD   0.97     // used >= quota * 这个值 就算归零
+#define RB_WIPE_THRESHOLD   0.82     // used >= quota * 这个值 就算归零（v82：同 RB_FLOW_FACTOR，提前换身份）
 
 
 
@@ -152,7 +153,9 @@
 
 #define RB_QUOTA_BYTES      (300LL * 1024 * 1024)  // 你的额度（300MB）
 
-#define RB_FLOW_FACTOR      0.95                   // 用到额度的这个比例就抹
+#define RB_FLOW_FACTOR      0.80                   // 用到额度的这个比例就抹
+// v82：0.95 = 285MB 太晚了。rb-shim(22) 第 74→76 行：跑到 251.6 MB 时 utun 被重建，
+// 之后再也连不上——服务端在额度见底前就开始动手。留出余量，在它动手之前先把身份换掉。
 
 #define RB_FLOW_TICK_SEC    5.0                    // 采样间隔（秒）
 
@@ -243,7 +246,8 @@
 // IssueNodeToken 拿新凭据（这是唯一能脱离福利档的路）。所以抹后自拉起，
 // 等界面出来就按两组盲坐标各点一次：先点连接按钮，再点节点列表第一项。
 // 点完看 currentNodeWithReason.bin 变不变 —— 变了就是真的选中了新节点。
-#define RB_AUTOTAP_ON        1
+#define RB_AUTOTAP_ON        0          // v82：关掉。v81 日志「UIEvent 没有 _touches ivar」
+                                        // —— 8 下全发不出去，白等 40 秒还挡着真正该做的事
 #define RB_AUTOTAP_DELAY     40.0      // 抹后多久开始点（等 App 把界面画完）
 #define RB_AUTOTAP_GAP       7.0       // 每点一下等多久再看结果
 
@@ -3829,7 +3833,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v81 节点导出\n"];
+        [out appendString:@"# rb-shim v82 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -6373,6 +6377,157 @@ static void rb_trace_frame(const char *dir, const char *from,
 
 
 
+#pragma mark - v82：额度上报改写
+
+// 服务端按客户端上报的「已用」记账（rb-req(2) 第 22 行那一帧逐字节解出来的
+// 就是 f2=配额 314572800 紧跟 f3=已用 314572800）。把 f3 报小，它就永远
+// 认为没用完 —— 不限速、不踢线、也不用再抹数据换身份。
+
+static int      gFakeN      = 0;      // 改写过多少次（只用来控制日志条数）
+static int      gFakeOff    = 0;      // 1=关掉（出过事就用它兜底）
+static uint64_t gFakeReal   = 0;      // 最近一次读到的真实已用（字节）
+
+#define RB_FAKE_USED_TO   (1024ULL * 1024ULL)   // 恒报 1MB
+
+static uint64_t rb_get_varint(const uint8_t *b, size_t n, size_t i, size_t *next) {
+    uint64_t v = 0;
+    int sh = 0;
+    size_t s0 = i;
+    while (i < n) {
+        uint8_t c = b[i++];
+        if (sh < 64) v |= (uint64_t)(c & 0x7f) << sh;
+        sh += 7;
+        if (!(c & 0x80)) break;
+        if (sh > 63) break;
+    }
+    *next = (i == s0) ? s0 : i;
+    return v;
+}
+
+// 把 v 写成刚好 len 个字节的 varint（len 不够长时截断）。长度不变 = 后面字段不错位。
+static void rb_put_varint(uint8_t *b, size_t len, uint64_t v) {
+    if (len == 0) return;
+    for (size_t i = 0; i + 1 < len; i++) {
+        b[i] = (uint8_t)((v & 0x7f) | 0x80);
+        v >>= 7;
+    }
+    b[len - 1] = (uint8_t)(v & 0x7f);
+}
+
+// 整块必须是能被完整走完的 protobuf —— 这是防止误判的关键。
+// 8 个参数里只有一对是 (buf,len)，其余是普通整数或对象指针；不校验就写内存
+// 等于随机篡改别人的数据，必崩。
+static int rb_pb_walk_ok(const uint8_t *b, size_t n) {
+    size_t i = 0;
+    int fields = 0;
+    while (i < n) {
+        size_t st = i;
+        uint64_t key = 0;
+        int sh = 0;
+        while (i < n) {
+            uint8_t c = b[i++];
+            if (sh < 64) key |= (uint64_t)(c & 0x7f) << sh;
+            sh += 7;
+            if (!(c & 0x80)) break;
+            if (sh > 63) return 0;
+        }
+        if (i == st) return 0;
+        uint64_t fn = key >> 3, wt = key & 7;
+        if (fn == 0 || fn > 5000) return 0;
+        if (wt == 0) {
+            int s2 = 0;
+            while (i < n) {
+                uint8_t c = b[i++];
+                s2 += 7;
+                if (!(c & 0x80)) break;
+                if (s2 > 63) return 0;
+            }
+        } else if (wt == 1) {
+            if (i + 8 > n) return 0;
+            i += 8;
+        } else if (wt == 2) {
+            size_t vs = i;
+            uint64_t L = 0;
+            int s2 = 0;
+            while (i < n) {
+                uint8_t c = b[i++];
+                if (s2 < 64) L |= (uint64_t)(c & 0x7f) << s2;
+                s2 += 7;
+                if (!(c & 0x80)) break;
+                if (s2 > 63) return 0;
+            }
+            if (i == vs) return 0;
+            if (L > (uint64_t)(n - i)) return 0;
+            i += (size_t)L;
+        } else if (wt == 5) {
+            if (i + 4 > n) return 0;
+            i += 4;
+        } else {
+            return 0;
+        }
+        fields++;
+    }
+    return (i == n && fields >= 2);
+}
+
+// 扫描一块出站报文，命中「f2=整MB配额 紧跟 f3=已用」就把已用改小。
+// 全程先把内存读出来分析，确认命中了才写回去，写失败也不崩。
+static int rb_fake_used(uint64_t p, uint64_t len) {
+    if (gFakeOff) return 0;
+    if (p < 0x100000000ULL) return 0;
+    if (len < 32 || len > 8192) return 0;
+
+    uint8_t *tmp = (uint8_t *)malloc((size_t)len);
+    if (!tmp) return 0;
+
+    size_t got = rb_read((const void *)(uintptr_t)p, tmp, (size_t)len);
+    if (got < 32 || got != (size_t)len) { free(tmp); return 0; }
+
+    if (!rb_pb_walk_ok(tmp, got)) { free(tmp); return 0; }
+
+    int hits = 0;
+    for (size_t i = 0; i + 4 < got; i++) {
+        if (tmp[i] != 0x10) continue;                 // f2，varint
+        size_t nx = 0;
+        uint64_t q = rb_get_varint(tmp, got, i + 1, &nx);
+        if (nx <= i + 1 || nx >= got) continue;
+        if (tmp[nx] != 0x18) continue;                // 紧跟 f3，varint
+        if (q < 100ULL * 1024 * 1024) continue;       // 配额至少 100MB
+        if (q % (1024ULL * 1024ULL)) continue;        // 必须是整 MB
+        size_t us = nx + 1, ue = 0;
+        uint64_t uv = rb_get_varint(tmp, got, us, &ue);
+        size_t ul = ue - us;
+        if (ul < 2 || ul > 6) continue;
+        if (uv < 1024ULL * 1024ULL) { i = ue - 1; continue; }   // 本来就很小的不动
+        gFakeReal = uv;
+        rb_put_varint(tmp + us, ul, RB_FAKE_USED_TO);
+        hits++;
+        i = ue - 1;
+    }
+
+    if (hits) {
+        kern_return_t kr = mach_vm_write(mach_task_self(), (mach_vm_address_t)p,
+                                         (vm_offset_t)tmp,
+                                         (mach_msg_type_number_t)got);
+        if (kr != KERN_SUCCESS) {
+            gFakeOff = 1;
+            free(tmp);
+            rb_log("额度上报改写：写内存失败(%d)，本次关掉改写，按原样发",
+                   (int)kr);
+            return 0;
+        }
+        if (gFakeN < 30 || (gFakeN % 100) == 0) {
+            rb_log("额度上报改写：%d 处「已用」%.1f MB → 1 MB（累计改写 %d 帧）"
+                   "—— 服务端按上报记账，报小它就认为没用完",
+                   hits, gFakeReal / 1048576.0, gFakeN);
+        }
+        gFakeN++;
+    }
+
+    free(tmp);
+    return hits;
+}
+
 #pragma mark - 原实现转发（8 个导出）
 
 
@@ -6545,6 +6700,9 @@ uint64_t rely_transport_request(uint64_t a0, uint64_t a1, uint64_t a2, uint64_t 
 
         for (int i = 0; i + 1 < 8; i++) rb_trace_frame("out", "request", v[i], v[i + 1]);
 
+        // v82：转发前把「已用额度」改小（服务端按上报记账）
+        for (int i = 0; i + 1 < 8; i++) rb_fake_used(v[i], v[i + 1]);
+
     }
 
     return gRequest(a0, a1, a2, a3, a4, a5, a6, a7);
@@ -6568,6 +6726,9 @@ uint64_t rely_transport_send_fire_and_forget(uint64_t a0, uint64_t a1, uint64_t 
         uint64_t v[8] = {a0, a1, a2, a3, a4, a5, a6, a7};
 
         for (int i = 0; i + 1 < 8; i++) rb_trace_frame("out", "ff", v[i], v[i + 1]);
+
+        // v82：这条路径也要改（流量心跳走 ff 的话，只有 request 改不到）
+        for (int i = 0; i + 1 < 8; i++) rb_fake_used(v[i], v[i + 1]);
 
     }
 
@@ -8377,13 +8538,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v81 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v82 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v81 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v82 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
@@ -8581,10 +8742,8 @@ static void rb_init(void) {
                                rb_prefs_dump(); rb_export_nodes(); }
         });
 
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(28 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            @autoreleasepool { rb_node_speedtest(); }
-        });
+        // v82：去掉启动 28 秒那次测速。节点是 QUIC(UDP/443)，这里拿 TCP 443 去握手，
+        // 结果永远是「全部连不上」（v81 日志第 64 行），测了没意义还把界面拖住。
 
             // 开着常连：进来就保证隧道是连着的（on-demand 装在 4 秒后，start 在 6 秒后）
 
