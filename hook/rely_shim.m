@@ -371,6 +371,8 @@
 
 #define RB_GROUP_ID   @"group.com.quietleafapp.vpn"
 
+static void rb_cap_save_opts_group(void);   // v84：抹完把启动参数存回 App Group
+
 #define RB_MIN_QUOTA  (100LL * 1024 * 1024)   // 小于 100MB 的 quota 不当额度看
 #define RB_MAX_QUOTA  (4LL * 1024 * 1024 * 1024)  // v63：大于 4GB 的「额度」是巧合
 #define RB_MIN_PB_LEN 64                      // v63：短包不跑 pb 判据（len=40 曾误命中）
@@ -457,7 +459,7 @@ static void rb_report_merge(void) {
 
                 if ([hl length])
 
-                    [out appendFormat:@"\n\n===== 连接过程摘要（v83，先看这段：抓到的参数 / 自动连接走了哪条路）=====\n%@", hl];
+                    [out appendFormat:@"\n\n===== 连接过程摘要（v84，先看这段：节点有没有补上 / 自动连接走了哪条路）=====\n%@", hl];
 
             }
 
@@ -3291,6 +3293,10 @@ static int rb_wipe_all(void) {
 
 
 
+    // v84：抹除会连 App Group 一起清，所以清完把 App 的启动参数重新放回去 ——
+    // 新进程（抹后自拉起）要靠它去带参数拉隧道，否则 provider 节点永远为空。
+    @try { rb_cap_save_opts_group(); } @catch (NSException *e) { }
+
     rb_log("抹数据完成：删掉 %d 个文件/目录，keychain %d 项，耗时 %.2fs",
 
            nf, nk, rb_now() - t0);
@@ -3626,10 +3632,189 @@ static void rb_cap_write_text(NSString *name, NSString *txt) {
     } @catch (NSException *e) { }
 }
 
+// ==================== v84：让 provider 能拿到节点 ====================
+// 隧道进程日志里那句 `[Leaf] 启动: 节点=` + `节点数据解码失败: 节点列表为空`
+// 说明它拿到的 initial_node_code 是空的。App 自动连接走的是不带参数的老接口
+// startVPNTunnelAndReturnError:，所以 options 直接是 nil。
+// 办法：把这条老接口接管，转成带 options 的新接口，options 里至少有 initial_node_code。
+
+static NSString *rb_cap_group_path(NSString *name) {
+    @try {
+        NSFileManager *fm = [NSFileManager defaultManager];
+        SEL sel = sel_registerName("containerURLForSecurityApplicationGroupIdentifier:");
+        if ([fm respondsToSelector:sel]) {
+            NSURL *gu = ((NSURL *(*)(id, SEL, id))objc_msgSend)(fm, sel,
+                             @"group.com.quietleafapp.vpn");
+            if (gu) return [[gu path] stringByAppendingPathComponent:name];
+        }
+    } @catch (NSException *e) { }
+    return nil;
+}
+
+// 从 protobuf 里取指定字段的字符串值（只看 wire type 2）
+static NSString *rb_pb_str_field(const uint8_t *b, size_t n, unsigned want) {
+    size_t i = 0;
+    while (i < n) {
+        uint64_t key = 0;
+        int sh = 0;
+        while (i < n) {
+            uint8_t c = b[i++];
+            if (sh < 64) key |= (uint64_t)(c & 0x7f) << sh;
+            sh += 7;
+            if (!(c & 0x80)) break;
+            if (sh > 63) return nil;
+        }
+        unsigned fn = (unsigned)(key >> 3), wt = (unsigned)(key & 7);
+        if (wt == 0) {
+            while (i < n) { uint8_t c = b[i++]; if (!(c & 0x80)) break; }
+        } else if (wt == 1) {
+            if (i + 8 > n) return nil;
+            i += 8;
+        } else if (wt == 2) {
+            uint64_t L = 0;
+            int s2 = 0;
+            size_t st = i;
+            while (i < n) {
+                uint8_t c = b[i++];
+                if (s2 < 64) L |= (uint64_t)(c & 0x7f) << s2;
+                s2 += 7;
+                if (!(c & 0x80)) break;
+                if (s2 > 63) return nil;
+            }
+            if (i == st) return nil;
+            if (L > (uint64_t)(n - i)) return nil;
+            if (fn == want)
+                return [[[NSString alloc] initWithBytes:(b + i)
+                                                 length:(NSUInteger)L
+                                               encoding:NSUTF8StringEncoding] autorelease];
+            i += (size_t)L;
+        } else if (wt == 5) {
+            if (i + 4 > n) return nil;
+            i += 4;
+        } else {
+            return nil;
+        }
+    }
+    return nil;
+}
+
+// 当前节点代号，就是节点文件里的 field 3，例如 v-linode-Singapore-2
+static NSString *rb_local_node_code(void) {
+    @try {
+        NSString *p = [[[NSHomeDirectory()
+                         stringByAppendingPathComponent:@"Library"]
+                        stringByAppendingPathComponent:@"Application Support"]
+                       stringByAppendingPathComponent:@"RelyVPN/currentNodeWithReason.bin"];
+        NSData *d = [NSData dataWithContentsOfFile:p];
+        if ([d length] < 8) return nil;
+        NSString *c = rb_pb_str_field((const uint8_t *)[d bytes], [d length], 3);
+        if ([c length] == 0 || [c length] > 200) return nil;
+        return c;
+    } @catch (NSException *e) { }
+    return nil;
+}
+
+// 拼一份可用的启动参数：尽量沿用 App 上次真实给的那份，缺 initial_node_code 就补上
+static id rb_cap_build_opts(void) {
+    NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    @try {
+        id base = gCapOpts;
+        if (![base isKindOfClass:[NSDictionary class]]) {
+            NSString *gp = rb_cap_group_path(@"rb-startopts.plist");
+            id t = gp ? [NSDictionary dictionaryWithContentsOfFile:gp] : nil;
+            if ([t isKindOfClass:[NSDictionary class]]) base = t;
+        }
+        if (![base isKindOfClass:[NSDictionary class]]) {
+            id t = [NSDictionary dictionaryWithContentsOfFile:
+                    rb_cap_path(@"rb-startopts.plist")];
+            if ([t isKindOfClass:[NSDictionary class]]) base = t;
+        }
+        if ([base isKindOfClass:[NSDictionary class]])
+            [d addEntriesFromDictionary:(NSDictionary *)base];
+        // 本地节点文件才是「当前选中的节点」，它优先于上次存下的旧值
+        NSString *code = rb_local_node_code();
+        if (code) [d setObject:code forKey:@"initial_node_code"];
+    } @catch (NSException *e) { }
+    return [d count] ? d : nil;
+}
+
+// 抹完把 App 的启动参数存回 App Group（抹除会连 App Group 一起清）
+static void rb_cap_save_opts_group(void) {
+    @try {
+        NSString *gp = rb_cap_group_path(@"rb-startopts.plist");
+        if (!gp) { rb_log("抹后存启动参数：拿不到 App Group 路径"); return; }
+        if ([gCapOpts isKindOfClass:[NSDictionary class]] &&
+            [(NSDictionary *)gCapOpts count] > 0) {
+            BOOL w = [(NSDictionary *)gCapOpts writeToFile:gp atomically:YES];
+            rb_log("抹后已把 App 启动参数存回 App Group：%s（%lu 个键）",
+                   w ? "成功" : "失败",
+                   (unsigned long)[(NSDictionary *)gCapOpts count]);
+        } else {
+            rb_log("抹后没有可存回的启动参数（本次运行没抓到 App 的 options）");
+        }
+    } @catch (NSException *e) { }
+}
+
+// 给 App 自己传进来的 options 补 initial_node_code（它传空或干脆没传都补）
+static id rb_cap_patch_opts(id opts) {
+    @try {
+        NSMutableDictionary *d = nil;
+        if ([opts isKindOfClass:[NSDictionary class]])
+            d = [NSMutableDictionary dictionaryWithDictionary:(NSDictionary *)opts];
+        else if (!opts)
+            d = [NSMutableDictionary dictionary];
+        else
+            return opts;
+        NSString *cur = [d objectForKey:@"initial_node_code"];
+        if ([cur isKindOfClass:[NSString class]] && [cur length] > 0) return d;
+        NSString *code = rb_local_node_code();
+        if (!code) {
+            rb_log("[CAP] ⚠️ options 里没有 initial_node_code，本地节点文件也没读到 node code");
+            return d;
+        }
+        [d setObject:code forKey:@"initial_node_code"];
+        rb_log("[CAP] ✅ 补上 initial_node_code=%s（App 原来%s）", [code UTF8String],
+               opts ? "给的是空值" : "整个 options 是 nil");
+        return d;
+    } @catch (NSException *e) { }
+    return opts;
+}
+
+// 接管不带参数的老接口：直接转成带 options 的新接口
+static BOOL (*rb_o_startPlain)(id, SEL, NSError **) = NULL;
+
+static BOOL rb_h_startPlain(id self, SEL _cmd, NSError **err) {
+    SEL sel2 = sel_registerName("startVPNTunnelWithOptions:andReturnError:");
+    @try {
+        Method m2 = (self && object_getClass(self))
+                        ? class_getInstanceMethod(object_getClass(self), sel2) : NULL;
+        if (m2) {
+            id opts = rb_cap_build_opts();
+            if (opts) {
+                gCapSelf = 1;
+                BOOL ok = NO;
+                @try {
+                    ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(
+                             self, sel2, opts, err);
+                } @finally {
+                    gCapSelf = 0;
+                }
+                NSString *code = [(NSDictionary *)opts objectForKey:@"initial_node_code"];
+                rb_log("[CAP] 不带参数的 start → 已改成带参数（node_code=%s）→ %s",
+                       code ? [code UTF8String] : "(无)", ok ? "返回成功" : "返回失败");
+                return ok;
+            }
+            rb_log("[CAP] 不带参数的 start：拼不出 options，退回原调用");
+        }
+    } @catch (NSException *e) { }
+    return rb_o_startPlain ? rb_o_startPlain(self, _cmd, err) : NO;
+}
+
 static BOOL (*rb_o_startOpts)(id, SEL, id, NSError **) = NULL;
 
 static BOOL rb_h_startOpts(id self, SEL _cmd, id opts, NSError **err) {
     @try {
+        opts = rb_cap_patch_opts(opts);
         if (opts) {
             if ([opts isKindOfClass:[NSDictionary class]] ||
                 [opts isKindOfClass:[NSArray class]]) {
@@ -3639,9 +3824,20 @@ static BOOL rb_h_startOpts(id self, SEL _cmd, id opts, NSError **err) {
                     [(NSDictionary *)opts writeToFile:rb_cap_path(@"rb-startopts.plist")
                                            atomically:YES];
                 } @catch (NSException *e1) { }
+                // v84：同存一份到 App Group（抹 App 数据不会立刻带走它）
+                @try {
+                    NSString *gp = rb_cap_group_path(@"rb-startopts.plist");
+                    if (gp) [(NSDictionary *)opts writeToFile:gp atomically:YES];
+                } @catch (NSException *e2) { }
                 NSString *txt = [NSString stringWithFormat:@"===== App 启动参数 =====\n%@\n",
                                  rb_cap_desc(opts, 0)];
                 rb_cap_write_text(@"rb-startopts.txt", txt);
+                @try {
+                    NSMutableString *ks = [NSMutableString string];
+                    for (id k in (NSDictionary *)opts)
+                        [ks appendFormat:@"%@,", k];
+                    rb_log("[CAP] options 键：%s", [ks UTF8String]);
+                } @catch (NSException *ek) { }
                 if (gCapSelf)
                     rb_log("[CAP] 我们自己带参数拉了一次（重放）：%s",
                            [rb_cap_desc(opts, 0) UTF8String]);
@@ -3720,17 +3916,28 @@ static void rb_cap_install(void) {
                         method_getImplementation(m2);
         method_setImplementation(m2, (IMP)rb_h_sendMsg);
     }
+    Method m3 = class_getInstanceMethod(S,
+                  sel_registerName("startVPNTunnelAndReturnError:"));
+    if (m3) {
+        rb_o_startPlain = (BOOL (*)(id, SEL, NSError **))method_getImplementation(m3);
+        method_setImplementation(m3, (IMP)rb_h_startPlain);
+    }
     gCapHooked = 1;
-    rb_log("[CAP] 已挂上：startVPNTunnelWithOptions=%d，sendProviderMessage=%d"
-           "（抓 App 真实参数，自动连接时重放）", m1 ? 1 : 0, m2 ? 1 : 0);
+    rb_log("[CAP] 已挂上：startVPNTunnelWithOptions=%d，sendProviderMessage=%d，"
+           "startVPNTunnelAndReturnError=%d（v84：无参数的 start 会自动补节点）",
+           m1 ? 1 : 0, m2 ? 1 : 0, m3 ? 1 : 0);
 }
 
 // 拿启动参数：内存里有就用内存，否则读上次存下的文件
 static id rb_cap_opts(void) {
     if (gCapOpts) return gCapOpts;
     @try {
-        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:
-                           rb_cap_path(@"rb-startopts.plist")];
+        NSDictionary *d = nil;
+        NSString *gp = rb_cap_group_path(@"rb-startopts.plist");
+        if (gp) d = [NSDictionary dictionaryWithContentsOfFile:gp];
+        if (![d isKindOfClass:[NSDictionary class]] || [d count] == 0)
+            d = [NSDictionary dictionaryWithContentsOfFile:
+                 rb_cap_path(@"rb-startopts.plist")];
         if ([d isKindOfClass:[NSDictionary class]] && [d count] > 0) {
             gCapOpts = [d copy];
             if (!gCapReplayLog) {
@@ -8671,7 +8878,7 @@ static void rb_init(void) {
 
         } else {
 
-            rb_log("rb-shim v83 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v84 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
