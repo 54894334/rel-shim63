@@ -1,15 +1,23 @@
 #!/usr/bin/env python3
 """插件版 dylib 出厂自检。
 
-CI 里编完就跑这一条：python3 hook/check_plugin.py RelyWipe.dylib
-本地也能跑（不需要 iOS SDK）。
+用法（CI）：
+    xcrun -sdk iphoneos nm -gU RelyWipe.dylib | awk '{print $NF}' | sort > syms.txt
+    python3 hook/check_plugin.py RelyWipe.dylib syms.txt
+
+用法（本地，只查字符串）：
+    python check_plugin.py RelyWipe.dylib
 
 查四件事：
   1. 8 个 rely_transport_* 同名符号**不能**导出（插件模式全改名成 rbplug_*，
      否则会和 framework 的符号撞名，dlsym(RTLD_DEFAULT) 会拿到我们的壳）
-  2. 必须有 rbplug_* 那批符号（说明改名生效，不是编了个空壳）
+  2. rbplug_* 那批符号必须导出（说明改名生效，不是编了个空壳）
   3. 关键字符串在（clang 会把部分中文编成 UTF-16，所以两种编码都查）
   4. 不能残留 tipa 版的启动串（rb-shim v85 ...）
+
+⚠️ 符号只能看 nm 的输出，不能在二进制里找 "\0名字\0" —— __cstring 里
+   resolve("rely_transport_new") 的字符串字面量刚好也是这个形状，
+   扫字节会 100% 误判（v86 第一次构建就是这么假失败的）。
 """
 import sys
 
@@ -38,6 +46,7 @@ MUST_HAVE = [
     "插件自停用",               # tipa 版共存检测
     "立即抹数据重来",            # 面板按钮
     "rely_transport_orig",     # 共存检测里比对的备份文件名
+    "RelyVPN 5.0.3.ipa",       # 共存检测的提示文案
 ]
 MUST_NOT = [
     "rb-shim v85 精简版",
@@ -57,13 +66,22 @@ def main() -> int:
     data = open(path, "rb").read()
     bad = []
 
-    # 符号表：Mach-O 的符号是 \x00 + 名字 + \x00 的形式，直接找字节即可
-    for s in BARE:
-        if b"\x00" + s.encode() + b"\x00" in data:
-            bad.append("不该导出裸符号 " + s)
-    for s in RENAMED:
-        if not has(data, s):
-            bad.append("缺改名后的符号 " + s)
+    syms = None
+    if len(sys.argv) > 2:
+        syms = set(x.strip() for x in open(sys.argv[2], encoding="utf-8") if x.strip())
+        if not syms:
+            bad.append("符号表是空的，nm 没输出？")
+
+    if syms is not None:
+        for s in BARE:
+            if "_" + s in syms:
+                bad.append("不该导出裸符号 " + s)
+        for s in RENAMED:
+            if "_" + s not in syms:
+                bad.append("缺改名后的符号 " + s)
+    else:
+        print("（没给符号表，跳过符号检查，只查字符串）")
+
     for s in MUST_HAVE:
         if not has(data, s):
             bad.append("缺字符串 " + s)
