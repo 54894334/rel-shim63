@@ -7864,6 +7864,7 @@ static void rb_heal_boot(void) {
 static int  gTapStep = -1;
 static int  gTapDone = 0;
 static int  gTapStarted = 0;
+static int  gTapHit  = 0;      // 真的点中了（节点文件变了）
 
 // 合成一次「按下 + 抬起」。返回 NO 表示 iOS 不认这套私有 ivar，本次放弃。
 static BOOL rb_tap_at(double nx, double ny) {
