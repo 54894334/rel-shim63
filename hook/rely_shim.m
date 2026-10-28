@@ -134,9 +134,11 @@
    autoOff 是旧的熔断标记、v85reset 已经是 YES 所以清不掉）。
    共用一份状态 = 一装上就继承一堆脏数据。用一个新文件名，从零开始。 */
 #define RB_STATE_NAME @"rb-plugin-state.plist"
+#define RB_PANEL_TITLE @"RelyVPN 自动抹数据（插件版）"
 #else
 #define RB_TAG "rb-shim v85"
 #define RB_STATE_NAME @"rb_state.plist"
+#define RB_PANEL_TITLE @"RelyVPN 自动抹数据 v85"
 #endif
 
 
@@ -7372,7 +7374,7 @@ static NSString *rb_status_text(void) {
 
     return [NSString stringWithFormat:
 
-        @"RelyVPN 自动抹数据 v65\n"
+        RB_PANEL_TITLE @"\n"
 
         @"额度 %.1f / %.0f MB（还剩 %.1f）%@\n"
 
@@ -8881,7 +8883,12 @@ static void rb_init(void) {
 
 
 
+#if RB_PLUGIN
+        if (!load_orig()) rb_log("插件模式：没拿到 framework 的函数指针"
+                                 "（不影响抹数据 —— App 调的本来就是原版 framework）");
+#else
         if (!load_orig()) rb_log("原实现加载失败，App 可能连不上");
+#endif
 
         // v55：快速通道不再只认 pendingStart。上次抹除之后还没稳定跑满
 
