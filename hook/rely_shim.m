@@ -8247,12 +8247,11 @@ static void rb_full_dump(const char *why) {
         [o appendString:@"\n===== 节点目录全部文件 hex =====\n"];
         rb_full_dump_files(o, rb_node_dir(), 0);
 
-        // 7. VPN 配置摘要
-        [o appendString:@"\n===== NE 配置 =====\n"];
+        // 7. VPN 配置摘要（内容要等回调才有，见下面 loadAllFromPreferences）
+        __block int wrote = 0;
         @try {
             Class C = objc_getClass("NETunnelProviderManager");
             if (C) {
-                __block int fin = 0;
                 void (^h2)(NSArray *, NSError *) = ^(NSArray *mans, NSError *err) {
                     (void)err;
                     NSMutableString *t = [NSMutableString string];
@@ -8271,16 +8270,18 @@ static void rb_full_dump(const char *why) {
                     NSString *old = [NSString stringWithContentsOfFile:fp
                                                               encoding:NSUTF8StringEncoding
                                                                  error:NULL] ?: @"";
-                    NSString *all = [NSString stringWithFormat:@"%@%@\n%@\n", old, o, t];
+                    // wrote=1 说明上面的同步写入已经把 o 落地了，这里就别再拼一遍
+                    NSString *all = [NSString stringWithFormat:@"%@%@\n===== NE 配置 =====\n%@\n",
+                                     old, wrote ? @"" : o, t];
                     if ([all length] > 600000)
                         all = [all substringFromIndex:[all length] - 600000];
                     [all writeToFile:fp atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-                    fin = 1;
+                    wrote = 1;
                 };
                 ((void (*)(id, SEL, id))objc_msgSend)(
                     C, sel_registerName("loadAllFromPreferencesWithCompletionHandler:"), h2);
-                if (!fin) {
-                    // 回调没同步跑（Normal），先按当前内容落地，后面还会再 dump 一次
+                if (!wrote) {
+                    // 回调没同步跑（Normal），先按当前内容落地，回调补 NE 段
                     NSString *fp = [NSHomeDirectory()
                                     stringByAppendingPathComponent:@"Documents/rb-full.txt"];
                     NSString *old = [NSString stringWithContentsOfFile:fp
@@ -8290,6 +8291,7 @@ static void rb_full_dump(const char *why) {
                     if ([all length] > 600000)
                         all = [all substringFromIndex:[all length] - 600000];
                     [all writeToFile:fp atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+                    wrote = 1;
                 }
             }
         } @catch (NSException *e) { }
