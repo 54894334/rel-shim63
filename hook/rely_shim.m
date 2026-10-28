@@ -129,8 +129,14 @@
 #define rely_transport_force_reconnect       rbplug_transport_force
 #define rely_transport_set_network_available rbplug_transport_setnet
 #define RB_TAG "rb-plugin v1"
+/* v86：状态文件单独一份。插件版是挂在别人装好的 App 上跑，那个 App 的 Data
+   容器里很可能还躺着 tipa 版留下的 rb_state.plist（flowBase 是旧 utun 读数、
+   autoOff 是旧的熔断标记、v85reset 已经是 YES 所以清不掉）。
+   共用一份状态 = 一装上就继承一堆脏数据。用一个新文件名，从零开始。 */
+#define RB_STATE_NAME @"rb-plugin-state.plist"
 #else
 #define RB_TAG "rb-shim v85"
+#define RB_STATE_NAME @"rb_state.plist"
 #endif
 
 
@@ -387,7 +393,7 @@
 
 
 
-#define RB_STATE_FILE @"rb_state.plist"
+#define RB_STATE_FILE RB_STATE_NAME
 
 #define RB_LOG_NAME_C "rb-shim.log"
 
