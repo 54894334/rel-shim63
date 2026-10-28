@@ -298,7 +298,7 @@
 
 #define RB_START_SETTLE_SEC  30.0    // 拉起后这么多秒内不判假连接
 
-#define RB_START_STUCK_SEC   45.0    // 一直停在「连接中」超过这么久才算卡死（v66：45 秒就 bounce）
+#define RB_START_STUCK_SEC   22.0    // v83：服务端 20 秒就判超时，45 秒太晚 —— 卡 22 秒就重拉
 
 #define RB_REFRESH_MB        5       // 抹除后跑掉这么多 MB 就认为额度已刷新（补刀复核用）
 
@@ -412,7 +412,8 @@ static void rb_report_merge(void) {
 
                           @"rb-kc.txt", @"rb-node-hex.txt", @"rb-auth-sample.txt",
 
-                          @"rb-necfg.txt", @"rb-full.txt", nil];
+                          @"rb-necfg.txt", @"rb-full.txt", @"rb-startopts.txt", @"rb-provmsg.txt",
+                          @"rb-caplog.txt", nil];
 
         NSMutableString *out = [NSMutableString stringWithCapacity:(1u << 19)];
 
@@ -481,6 +482,41 @@ static void rb_report_merge(void) {
             [out appendString:s];
 
         }
+
+        // v83：隧道进程（appex）自己写的日志 —— 它才说得清「为什么连不上」。
+        // 之前从来没抓过：它在 App Group 容器里，不在 App 沙盒里。
+        @try {
+
+            NSURL *gu = [[NSFileManager defaultManager]
+                         containerURLForSecurityApplicationGroupIdentifier:
+                             @"group.com.quietleafapp.vpn"];
+
+            if (gu) {
+
+                NSString *lgp = [[gu path] stringByAppendingPathComponent:@"relyvpn.log"];
+
+                NSString *lg = [NSString stringWithContentsOfFile:lgp
+                                                         encoding:NSUTF8StringEncoding
+                                                            error:NULL];
+
+                if ([lg length] > 0) {
+
+                    if ([lg length] > 90000)
+                        lg = [lg substringFromIndex:[lg length] - 90000];
+
+                    [out appendFormat:@"\n\n===== 隧道进程自己的日志 relyvpn.log（尾巴 90KB）"
+                                      "=====\n%@", lg];
+
+                } else {
+
+                    [out appendFormat:@"\n\n===== 隧道进程日志 relyvpn.log 读不到（%@）=====\n",
+                                      lgp];
+
+                }
+
+            }
+
+        } @catch (NSException *e) { }
 
         [out writeToFile:[doc stringByAppendingPathComponent:@"rb-report.txt"]
 
@@ -3525,6 +3561,210 @@ static int rb_has_lc(const char *hay, const char *needle) {
 
 // 行为等价但不会再漏；每个候选都把「认不认」打进日志，下次不用再猜。
 
+
+// ==================== v83：抓住 App 自己的启动参数，原样重放 ====================
+// rb-full.txt 里 NE 配置只有一行「RelyVPN.tunnelProfileMarker = v1」——节点压根不在
+// providerConfiguration 里。而隧道插件里有 handleAppMessage switchNode: /
+// startTunnelWithOptions:completionHandler: / node_token_cache / IssueNodeToken RPC，
+// 说明「连哪个节点、用哪个 token」是 App 在 start 参数或 provider 消息里传下去的。
+// 我们一直拿 nil 参数裸调 start，provider 只能用自己容器里残留的旧节点旧 token，
+// 服务端不认 → 20 秒判超时 → 界面永远「正在连接」。手动点一下立刻就好，
+// 差别就在那一走带了参数。所以：把 App 真实用的参数原样抓下来，自动连接时原样重放。
+static id      gCapOpts    = nil;
+static NSData *gCapMsg     = nil;
+static int     gCapHooked  = 0;
+static int     gCapTries   = 0;
+static int     gCapSelf    = 0;      // 1 = 这次 start 是我们自己调的，别当成 App 的
+static int     gCapReplayLog = 0;
+
+static NSString *rb_cap_path(NSString *name) {
+    return [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents"]
+            stringByAppendingPathComponent:name];
+}
+
+static NSString *rb_cap_hexhead(NSData *d) {
+    if (!d) return @"(nil)";
+    NSUInteger n = [d length];
+    if (n > 48) n = 48;
+    const uint8_t *b = (const uint8_t *)[d bytes];
+    NSMutableString *s = [NSMutableString string];
+    for (NSUInteger i = 0; i < n; i++) [s appendFormat:@"%02x", b[i]];
+    return s;
+}
+
+static NSString *rb_cap_desc(id v, int depth) {
+    if (!v) return @"(nil)";
+    if (depth > 2) return @"...";
+    if ([v isKindOfClass:[NSString class]]) return v;
+    if ([v isKindOfClass:[NSNumber class]]) return [v description];
+    if ([v isKindOfClass:[NSData class]])
+        return [NSString stringWithFormat:@"<data %lu>",
+                (unsigned long)[(NSData *)v length]];
+    if ([v isKindOfClass:[NSArray class]]) {
+        NSMutableString *s = [NSMutableString stringWithString:@"["];
+        for (id e in (NSArray *)v) [s appendFormat:@"%@, ", rb_cap_desc(e, depth + 1)];
+        [s appendString:@"]"];
+        return s;
+    }
+    if ([v isKindOfClass:[NSDictionary class]]) {
+        NSMutableString *s = [NSMutableString stringWithString:@"{"];
+        for (id k in (NSDictionary *)v)
+            [s appendFormat:@"%@=%@; ", k,
+                rb_cap_desc([(NSDictionary *)v objectForKey:k], depth + 1)];
+        [s appendString:@"}"];
+        return s;
+    }
+    return [v description];
+}
+
+static void rb_cap_write_text(NSString *name, NSString *txt) {
+    if (!txt) return;
+    @try {
+        if ([txt length] > 20000) txt = [txt substringToIndex:20000];
+        [txt writeToFile:rb_cap_path(name) atomically:YES
+                encoding:NSUTF8StringEncoding error:NULL];
+    } @catch (NSException *e) { }
+}
+
+static BOOL (*rb_o_startOpts)(id, SEL, id, NSError **) = NULL;
+
+static BOOL rb_h_startOpts(id self, SEL _cmd, id opts, NSError **err) {
+    @try {
+        if (opts) {
+            if ([opts isKindOfClass:[NSDictionary class]] ||
+                [opts isKindOfClass:[NSArray class]]) {
+                @try { [gCapOpts release]; } @catch (NSException *e0) { }
+                gCapOpts = [opts copy];
+                @try {
+                    [(NSDictionary *)opts writeToFile:rb_cap_path(@"rb-startopts.plist")
+                                           atomically:YES];
+                } @catch (NSException *e1) { }
+                NSString *txt = [NSString stringWithFormat:@"===== App 启动参数 =====\n%@\n",
+                                 rb_cap_desc(opts, 0)];
+                rb_cap_write_text(@"rb-startopts.txt", txt);
+                rb_log("[CAP] ✅ 抓到 App 的启动参数：%s", [rb_cap_desc(opts, 0) UTF8String]);
+            } else {
+                rb_log("[CAP] App 启动参数类型 %s：%s",
+                       [[opts className] UTF8String], [rb_cap_desc(opts, 0) UTF8String]);
+            }
+        } else if (!gCapSelf) {
+            rb_log("[CAP] App 这次启动没带参数（options=nil）");
+        }
+    } @catch (NSException *e) { }
+    return rb_o_startOpts ? rb_o_startOpts(self, _cmd, opts, err) : NO;
+}
+
+static BOOL (*rb_o_sendMsg)(id, SEL, id, NSError **, void (^)(NSData *)) = NULL;
+
+static BOOL rb_h_sendMsg(id self, SEL _cmd, id data, NSError **err,
+                         void (^rh)(NSData *)) {
+    @try {
+        if ([data isKindOfClass:[NSData class]] && [(NSData *)data length] > 0) {
+            @try { [gCapMsg release]; } @catch (NSException *e0) { }
+            gCapMsg = [(NSData *)data copy];
+            @try {
+                [gCapMsg writeToFile:rb_cap_path(@"rb-provmsg.bin") atomically:YES];
+            } @catch (NSException *e1) { }
+            NSString *txt = [NSString stringWithFormat:
+                             @"===== App → provider 消息 =====\n长度 %lu\n十六进制（前 1024）：\n%@\n",
+                             (unsigned long)[(NSData *)data length],
+                             [rb_cap_hexhead((NSData *)data) stringByAppendingString:@"..."]];
+            rb_cap_write_text(@"rb-provmsg.txt", txt);
+            rb_log("[CAP] ✅ App→provider 消息 %lu 字节：%s",
+                   (unsigned long)[(NSData *)data length],
+                   [rb_cap_hexhead((NSData *)data) UTF8String]);
+        }
+    } @catch (NSException *e) { }
+    return rb_o_sendMsg ? rb_o_sendMsg(self, _cmd, data, err, rh) : NO;
+}
+
+static BOOL rb_cap_start_tramp(id obj, SEL sel, id opts, NSError **e) {
+    gCapSelf = 1;
+    BOOL ok = NO;
+    @try {
+        ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(obj, sel, opts, e);
+    } @finally {
+        gCapSelf = 0;
+    }
+    return ok;
+}
+
+static void rb_cap_install(void) {
+    if (gCapHooked) return;
+    Class S = objc_getClass("NETunnelProviderSession");
+    if (!S) {
+        if (++gCapTries < 12) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(2 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{ rb_cap_install(); });
+        } else {
+            rb_log("[CAP] 抓不到 NETunnelProviderSession，本次不抓");
+        }
+        return;
+    }
+    Method m1 = class_getInstanceMethod(S,
+                  sel_registerName("startVPNTunnelWithOptions:andReturnError:"));
+    if (m1) {
+        rb_o_startOpts = (BOOL (*)(id, SEL, id, NSError **))method_getImplementation(m1);
+        method_setImplementation(m1, (IMP)rb_h_startOpts);
+    }
+    Method m2 = class_getInstanceMethod(S,
+                  sel_registerName("sendProviderMessage:returnError:responseHandler:"));
+    if (m2) {
+        rb_o_sendMsg = (BOOL (*)(id, SEL, id, NSError **, void (^)(NSData *)))
+                        method_getImplementation(m2);
+        method_setImplementation(m2, (IMP)rb_h_sendMsg);
+    }
+    gCapHooked = 1;
+    rb_log("[CAP] 已挂上：startVPNTunnelWithOptions=%d，sendProviderMessage=%d"
+           "（抓 App 真实参数，自动连接时重放）", m1 ? 1 : 0, m2 ? 1 : 0);
+}
+
+// 拿启动参数：内存里有就用内存，否则读上次存下的文件
+static id rb_cap_opts(void) {
+    if (gCapOpts) return gCapOpts;
+    @try {
+        NSDictionary *d = [NSDictionary dictionaryWithContentsOfFile:
+                           rb_cap_path(@"rb-startopts.plist")];
+        if ([d isKindOfClass:[NSDictionary class]] && [d count] > 0) {
+            gCapOpts = [d copy];
+            if (!gCapReplayLog) {
+                gCapReplayLog = 1;
+                rb_log("[CAP] 用上次存下的启动参数重放：%s",
+                       [rb_cap_desc(d, 0) UTF8String]);
+            }
+            return gCapOpts;
+        }
+    } @catch (NSException *e) { }
+    return nil;
+}
+
+// 重放 App 发给隧道进程的那条消息（通常是 switchNode）
+static void rb_cap_replay_msg(id conn) {
+    if (!conn) return;
+    NSData *d = gCapMsg;
+    if (!d) {
+        @try { d = [NSData dataWithContentsOfFile:rb_cap_path(@"rb-provmsg.bin")]; }
+        @catch (NSException *e) { }
+    }
+    if (![d isKindOfClass:[NSData class]] || [d length] == 0) return;
+    if (![conn respondsToSelector:sel_registerName(
+            "sendProviderMessage:returnError:responseHandler:")]) return;
+    NSError *e = nil;
+    BOOL ok = NO;
+    @try {
+        ok = ((BOOL (*)(id, SEL, id, NSError **, void (^)(NSData *)))objc_msgSend)(
+                 conn, sel_registerName("sendProviderMessage:returnError:responseHandler:"),
+                 d, &e, ^(NSData *r) {
+                     if (r) rb_log("[CAP] 重放消息有回包：%lu 字节",
+                                   (unsigned long)[r length]);
+                 });
+    } @catch (NSException *ex) { }
+    rb_log("[CAP] 重放 App→provider 消息（%lu 字节）→ %s%s%s",
+           (unsigned long)[d length], ok ? "已发出" : "失败",
+           e ? "（" : "", e ? [[e localizedDescription] UTF8String] : "");
+}
+
 static BOOL rb_ne_start(id m) {
 
     // v59：上一版已经确认「manager 上没有 start 接口，connection 上有」——
@@ -3551,7 +3791,10 @@ static BOOL rb_ne_start(id m) {
 
 
 
-    for (int i = 0; i < 4 && !gMgrStartLogged; i++) {
+    int rb_mord[4] = {0, 1, 2, 3};
+    if (rb_cap_opts()) { rb_mord[0] = 1; rb_mord[1] = 0; }
+    for (int oi = 0; oi < 4 && !gMgrStartLogged; oi++) {
+        int i = rb_mord[oi];
 
         BOOL resp = [m respondsToSelector:cands[i].sel];
 
@@ -3565,7 +3808,7 @@ static BOOL rb_ne_start(id m) {
 
                 ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(
 
-                         m, cands[i].sel, (id)nil, &e);
+                         m, cands[i].sel, rb_cap_opts(), &e);
 
             } else if (cands[i].kind == 0) {
 
@@ -3649,6 +3892,10 @@ static BOOL rb_ne_start(id m) {
 
     if (!conn) return NO;
 
+    // v83：先把 App 上次发给隧道进程的那条消息（节点切换）重放一遍，
+    // 让 provider 用「App 会用的那个节点」去连，而不是它容器里的旧节点。
+    @try { rb_cap_replay_msg(conn); } @catch (NSException *eRM) { }
+
     struct { SEL sel; int kind; } cc[6];
 
     cc[0].sel = @selector(startVPNTunnelAndReturnError:);             cc[0].kind = 0;
@@ -3663,7 +3910,14 @@ static BOOL rb_ne_start(id m) {
 
     cc[5].sel = @selector(start);                                     cc[5].kind = 2;
 
-    for (int i = 0; i < 6; i++) {
+    // v83：只要抓到过 App 的启动参数，就先走「带参数」那条 —— 否则第一条
+    // startVPNTunnelAndReturnError: 永远返回 YES（没参数它也说成功），
+    // 参数根本轮不到用，就是日志里那句「用 connection.startVPNTunnelAndReturnError: → 成功」
+    // 之后一直卡在「正在连接」的真正原因。
+    int rb_ord[6] = {0, 1, 2, 3, 4, 5};
+    if (rb_cap_opts()) { rb_ord[0] = 1; rb_ord[1] = 0; }
+    for (int oi = 0; oi < 6; oi++) {
+        int i = rb_ord[oi];
 
         BOOL resp = [conn respondsToSelector:cc[i].sel];
 
@@ -3675,9 +3929,7 @@ static BOOL rb_ne_start(id m) {
 
             if (cc[i].kind == 1) {
 
-                ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(
-
-                         conn, cc[i].sel, (id)nil, &e);
+                ok = rb_cap_start_tramp(conn, cc[i].sel, rb_cap_opts(), &e);
 
             } else if (cc[i].kind == 0) {
 
@@ -3831,7 +4083,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v82 节点导出\n"];
+        [out appendString:@"# rb-shim v83 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -4816,6 +5068,8 @@ static void rb_auto_start_vpn(int attempt);
 // 连上过（出过流量）之后恢复按开关走，用户想断随时能断。
 static BOOL rb_force_after_wipe(void) {
 
+    return NO;   // v83：v82 的覆盖已回滚，开关说了算
+
     if (!rb_just_wiped()) return NO;
 
     @try {
@@ -4842,21 +5096,11 @@ static void rb_auto_start_vpn(int attempt) {
 
     if (!rb_auto_on()) {
 
-        if (!rb_force_after_wipe()) {
+        // v83：回滚 v82。开关按你说的来：开＝打开 App 自动连，关＝不自动连。
+        // （v82 强行越过开关是错的，已撤掉。）
+        rb_log("自动连接已关，跳过自动重连（手动点连接照常可用）");
 
-            rb_log("自动连接已关，跳过自动重连");
-
-            return;
-
-        }
-
-        if (!gForceWipeLogged) {
-
-            gForceWipeLogged = 1;
-
-            rb_log("自动连接是关的，但这是抹除之后、还没连上 —— 照样连（v82）");
-
-        }
+        return;
 
     }
 
@@ -8418,13 +8662,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v82 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v83 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v82 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v83 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
@@ -8439,6 +8683,12 @@ static void rb_init(void) {
 
 
         if (!load_orig()) rb_log("原实现加载失败，App 可能连不上");
+
+        // v83：2 秒后挂「抓 App 启动参数」的钩子（NetworkExtension 可能还没加载）
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            @autoreleasepool { @try { rb_cap_install(); } @catch (NSException *e) { } }
+        });
 
 
 
@@ -8569,7 +8819,7 @@ static void rb_init(void) {
 
         // v82：抹后自拉起这一趟也必须装 on-demand，否则开关一关，隧道断了
         // 系统不会自己重连，用户只能手动点。
-        if (gAutoOn || rb_force_after_wipe()) {
+        if (gAutoOn) {
 
             // 开着常连：把 iOS 系统级的 on-demand 常连规则装上，之后连不连由系统管
 
@@ -8618,7 +8868,7 @@ static void rb_init(void) {
         rb_keepalive_boot();
 
         // v82：同理 —— 抹后自拉起这一趟，开关关着也要把隧道拉起来
-        if (rb_auto_on() || rb_force_after_wipe()) {
+        if (rb_auto_on()) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             @autoreleasepool { if (!rb_just_wiped()) { rb_node_files_restore(); rb_prefs_restore(); }
