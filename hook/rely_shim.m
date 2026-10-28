@@ -3642,7 +3642,12 @@ static BOOL rb_h_startOpts(id self, SEL _cmd, id opts, NSError **err) {
                 NSString *txt = [NSString stringWithFormat:@"===== App 启动参数 =====\n%@\n",
                                  rb_cap_desc(opts, 0)];
                 rb_cap_write_text(@"rb-startopts.txt", txt);
-                rb_log("[CAP] ✅ 抓到 App 的启动参数：%s", [rb_cap_desc(opts, 0) UTF8String]);
+                if (gCapSelf)
+                    rb_log("[CAP] 我们自己带参数拉了一次（重放）：%s",
+                           [rb_cap_desc(opts, 0) UTF8String]);
+                else
+                    rb_log("[CAP] ✅ 抓到 App 的启动参数：%s",
+                           [rb_cap_desc(opts, 0) UTF8String]);
             } else {
                 rb_log("[CAP] App 启动参数类型 %s：%s",
                        [[opts className] UTF8String], [rb_cap_desc(opts, 0) UTF8String]);
@@ -3806,9 +3811,7 @@ static BOOL rb_ne_start(id m) {
 
             if (cands[i].kind == 1) {
 
-                ok = ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(
-
-                         m, cands[i].sel, rb_cap_opts(), &e);
+                ok = rb_cap_start_tramp(m, cands[i].sel, rb_cap_opts(), &e);
 
             } else if (cands[i].kind == 0) {
 
