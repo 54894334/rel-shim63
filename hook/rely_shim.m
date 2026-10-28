@@ -439,17 +439,17 @@ static void rb_report_merge(void) {
 
                     (void)stop;
 
-                    if ([line rangeOfString:@"[HEAL]"].location != NSNotFound ||
+                    // v83：先看「抓到了什么参数」「自动连接走了哪条路」——
+                    // v80 那套自愈阶梯已经停了，摘要改成这两类。
+                    if ([line rangeOfString:@"[CAP]"].location != NSNotFound ||
 
-                        [line rangeOfString:@"[H1]"].location != NSNotFound ||
+                        [line rangeOfString:@"自动重连"].location != NSNotFound ||
 
-                        [line rangeOfString:@"[H2]"].location != NSNotFound ||
+                        [line rangeOfString:@"自动连接"].location != NSNotFound ||
 
-                        [line rangeOfString:@"[H3]"].location != NSNotFound ||
+                        [line rangeOfString:@"检测到 App"].location != NSNotFound ||
 
-                        [line rangeOfString:@"[H4]"].location != NSNotFound ||
-
-                        [line rangeOfString:@"[H5]"].location != NSNotFound)
+                        [line rangeOfString:@"节点恢复"].location != NSNotFound)
 
                         [hl appendFormat:@"%@\n", line];
 
@@ -457,7 +457,7 @@ static void rb_report_merge(void) {
 
                 if ([hl length])
 
-                    [out appendFormat:@"\n\n===== 自愈阶梯结论（v80，先看这段）=====\n%@", hl];
+                    [out appendFormat:@"\n\n===== 连接过程摘要（v83，先看这段：抓到的参数 / 自动连接走了哪条路）=====\n%@", hl];
 
             }
 
