@@ -234,6 +234,19 @@
                                        // 「手动换节点就恢复」，这条自动化等价于那一步
                                        // 每次都把刚连好的隧道拆掉，收益从未被证实。
                                        // 要试就改回 1（面板 b8 手动按钮不受这个开关影响）
+// ---- v81 ----
+// v81：自愈阶梯整体关掉。rb-shim(21) 实锤它不是救命是拆台：
+// H1/H2 每 25 秒 stop 一次隧道，中途还把「自动连接开关」关掉，
+// 最后隧道停着、开关是关的、没人再拉 = 永远「正在连接」。
+#define RB_HEAL_ON           0
+// v81：自动点节点。抹完数据后 App 一定要「有人点一下节点」才会去
+// IssueNodeToken 拿新凭据（这是唯一能脱离福利档的路）。所以抹后自拉起，
+// 等界面出来就按两组盲坐标各点一次：先点连接按钮，再点节点列表第一项。
+// 点完看 currentNodeWithReason.bin 变不变 —— 变了就是真的选中了新节点。
+#define RB_AUTOTAP_ON        1
+#define RB_AUTOTAP_DELAY     40.0      // 抹后多久开始点（等 App 把界面画完）
+#define RB_AUTOTAP_GAP       7.0       // 每点一下等多久再看结果
+
 #define RB_NODE_SELF_SEC     180.0      // 抹除后这么久内算「刚抹完」→ 不写回旧节点，让 App 自己选
 #define RB_NODE_LIMIT_KBPS   150.0      // v78：抹后平均速率低于这个（KB/s）才动手。
                                        // 160Kbps 福利档 ≈ 20 KB/s，正常 8000+，150 是很宽的门槛
@@ -398,7 +411,7 @@ static void rb_report_merge(void) {
 
                           @"rb-kc.txt", @"rb-node-hex.txt", @"rb-auth-sample.txt",
 
-                          @"rb-necfg.txt", nil];
+                          @"rb-necfg.txt", @"rb-full.txt", nil];
 
         NSMutableString *out = [NSMutableString stringWithCapacity:(1u << 19)];
 
@@ -1321,6 +1334,7 @@ static void rb_ne_dump_cfg(NSArray *mans);          // v72 只读诊断
 static void rb_ne_watch_config(int left);
 
 static void rb_panel_refresh(void);
+static void rb_full_dump(const char *why);   // v81 全量诊断
 
 #if !RB_PANEL
 
@@ -2721,7 +2735,12 @@ static BOOL rb_node_files_restore_raw(void) {
 
             NSString *full = [dir stringByAppendingPathComponent:it];
 
-            if ([d writeToFile:full atomically:YES]) n++;
+            if ([d writeToFile:full atomically:YES]) {
+                n++;
+                // v81：原样写回也要记下「这是我们写的」—— 否则 watch / TAP 会把它
+                // 当成「App 已经选了新节点」，直接吃假成功。
+                @try { [gNodeWrote release]; gNodeWrote = [d copy]; } @catch (NSException *e) { }
+            }
 
         }
 
@@ -3101,6 +3120,10 @@ static int rb_wipe_all(void) {
     NSString *lib  = [home stringByAppendingPathComponent:@"Library"];
 
     double t0 = rb_now();
+
+    // v81：先把「抹之前」的现场全量存一份 —— 只盯节点文件不够，
+    // 旧凭据被 App 记在别处才会出现「抹完自己长回来」这种事。
+    @try { rb_full_dump("抹除前"); } @catch (NSException *e) { }
 
 
 
@@ -3806,7 +3829,7 @@ static NSString *rb_printable(const uint8_t *b, size_t n) {
 static void rb_export_nodes(void) {
     @try {
         NSMutableString *out = [NSMutableString string];
-        [out appendString:@"# rb-shim v80 节点导出\n"];
+        [out appendString:@"# rb-shim v81 节点导出\n"];
         NSFileManager *fmr = [NSFileManager defaultManager];
         NSString *home = NSHomeDirectory();
         NSArray *roots = [NSArray arrayWithObjects:
@@ -4864,10 +4887,12 @@ static void rb_auto_start_vpn(int attempt) {
 
                     }
 
-                    rb_log("自动重连：状态 %d 卡了 %.0f 秒还没连上 —— 停掉，3 秒后重拉",
-                           cur, since);
-
-                    rb_stop_vpn();
+                    // v81：这里原来先 stop 再 start。stop 一次 provider 就得重走
+                    // 全部握手，而 App 侧节点凭据是旧的，重握手照样 20 秒超时 ——
+                    // 结果就是「停→拉→超时→停」无限转圈，界面永远「正在连接」。
+                    // 现在只再 start 一次（start 是幂等的，不会打断已有隧道）。
+                    rb_log("自动重连：状态 %d 卡了 %.0f 秒还没连上 —— 直接再拉一次"
+                           "（v81：不停隧道）", cur, since);
 
                     dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
 
@@ -7799,6 +7824,7 @@ static void rb_heal_tick(void) {
 }
 
 static void rb_heal_boot(void) {
+    if (!RB_HEAL_ON) return;        // v81：整体停用（见 RB_HEAL_ON 定义处注释）
     if (gHealDone) return;
 
     // v80 自检：H5 会自拉起 App，新进程会重新挂阶梯 —— 不清计数就会「拉起→阶梯→拉起」
@@ -7819,6 +7845,460 @@ static void rb_heal_boot(void) {
     rb_heal_tick();
 }
 
+
+// ==================== v81 自动点节点（TAP） ====================
+// 为什么非点不可：
+//   currentNodeWithReason.bin 里的 f14.f2（节点凭据）和 f22（授权串）是服务端
+//   IssueNodeToken 签发的，绑「当前这个设备身份」。抹掉 App 数据换来新身份
+//   （rb-req(2)：DATA_xxx 换了），磁盘上却还是旧凭据 —— 隧道能起来，但服务端
+//   按福利档压速（rb-shim(21)：21.5 KB/s），20 秒判超时踢线，然后一直「正在连接」。
+//   而 IssueNodeToken 这个请求，App 只在你点一下节点的时候才发。
+//   所以这里替你去点两下：先点「连接」按钮（App 会跳到节点列表），再点列表第一项。
+//   点完看 currentNodeWithReason.bin 有没有变 —— 变了就是真的换了新凭据，立刻拉隧道。
+//
+// 安全性：全程 @try，任何一个私有 ivar 填不进去就放弃这一次点击，绝不发半成品事件。
+//         全部失败也只是「点了没反应」，不会崩、不会拆隧道、不会动配置。
+
+#define RB_TAP_N   8
+
+static int  gTapStep = -1;
+static int  gTapDone = 0;
+static int  gTapStarted = 0;
+
+// 合成一次「按下 + 抬起」。返回 NO 表示 iOS 不认这套私有 ivar，本次放弃。
+static BOOL rb_tap_at(double nx, double ny) {
+
+    @try {
+
+        id app = [UIApplication sharedApplication];
+        if (!app) return NO;
+
+        if ([[app valueForKey:@"applicationState"] intValue] != 0) {
+            rb_log("[TAP] App 不在前台（state=%d），这次不点",
+                   [[app valueForKey:@"applicationState"] intValue]);
+            return NO;
+        }
+
+        id win = nil;
+        @try { win = [app valueForKey:@"keyWindow"]; } @catch (NSException *e) { }
+        if (!win) {
+            for (id w in ((NSArray *)((id (*)(id, SEL))objc_msgSend)(app, sel_registerName("windows")))) {
+                if ([w isKindOfClass:[UIWindow class]]) { win = w; break; }
+            }
+        }
+        if (!win) { rb_log("[TAP] 找不到主窗口"); return NO; }
+
+        CGRect b = ((CGRect (*)(id, SEL))objc_msgSend)(win, sel_registerName("bounds"));
+        if (b.size.width < 50 || b.size.height < 50) return NO;
+        CGPoint pt = CGPointMake((CGFloat)(b.size.width * nx),
+                                 (CGFloat)(b.size.height * ny));
+
+        Class TC = NSClassFromString(@"UITouch");
+        Class EC = NSClassFromString(@"UIEvent");
+        if (!TC || !EC) { rb_log("[TAP] 系统里没有 UITouch/UIEvent 类"); return NO; }
+
+        id touch = ((id (*)(id, SEL))objc_msgSend)(
+                       ((id (*)(id, SEL))objc_msgSend)(TC, sel_registerName("alloc")),
+                       sel_registerName("init"));
+        id ev    = ((id (*)(id, SEL))objc_msgSend)(
+                       ((id (*)(id, SEL))objc_msgSend)(EC, sel_registerName("alloc")),
+                       sel_registerName("init"));
+        if (!touch || !ev) { rb_log("[TAP] UITouch/UIEvent 造不出来"); return NO; }
+
+        int bad = 0;
+
+        @try { [touch setValue:win forKey:@"window"]; } @catch (NSException *e) { bad++; }
+        @try { [touch setValue:win forKey:@"view"]; } @catch (NSException *e) { bad++; }
+        @try { [touch setValue:[NSValue valueWithCGPoint:pt] forKey:@"locationInWindow"]; }
+        @catch (NSException *e) { bad++; }
+        @try { [touch setValue:[NSValue valueWithCGPoint:pt] forKey:@"previousLocationInWindow"]; }
+        @catch (NSException *e) { }
+        @try { [touch setValue:[NSNumber numberWithInt:1] forKey:@"tapCount"]; }
+        @catch (NSException *e) { }
+        @try { [touch setValue:[NSNumber numberWithInt:1] forKey:@"_pathIndex"]; }
+        @catch (NSException *e) { }
+        @try { [touch setValue:[NSNumber numberWithInt:1] forKey:@"_pathIdentity"]; }
+        @catch (NSException *e) { }
+        @try { [touch setValue:[NSNumber numberWithBool:YES] forKey:@"_isFirstTouchForView"]; }
+        @catch (NSException *e) { }
+        @try { [touch setValue:[NSDate date] forKey:@"timestamp"]; } @catch (NSException *e) { }
+
+        // 关键的三个 ivar 有一个填不进去就不发事件 —— 发半成品最容易崩
+        if (bad >= 2) {
+            rb_log("[TAP] UITouch 私有 ivar 填不进去（%d 个），这套方法在你这版系统上不可用", bad);
+            return NO;
+        }
+
+        @try { [ev setValue:[NSSet setWithObject:touch] forKey:@"_touches"]; }
+        @catch (NSException *e) {
+            rb_log("[TAP] UIEvent 没有 _touches ivar，放弃");
+            return NO;
+        }
+
+        // phase：0=began 1=moved 3=ended
+        @try { [touch setValue:[NSNumber numberWithInt:0] forKey:@"phase"]; }
+        @catch (NSException *e) { }
+        ((void (*)(id, SEL, id))objc_msgSend)(app, sel_registerName("sendEvent:"), ev);
+
+        @try { [touch setValue:[NSNumber numberWithInt:3] forKey:@"phase"]; }
+        @catch (NSException *e) { }
+        ((void (*)(id, SEL, id))objc_msgSend)(app, sel_registerName("sendEvent:"), ev);
+
+        return YES;
+
+    } @catch (NSException *e) {
+        rb_log("[TAP] 合成点击抛异常：%s", [[e reason] UTF8String]);
+        return NO;
+    }
+}
+
+// 节点文件跟「我们写的那份」不一样 = App 真的重新申请了凭据
+static BOOL rb_node_file_changed(void) {
+
+    @try {
+
+        NSString *f = [rb_node_dir() stringByAppendingPathComponent:@"currentNodeWithReason.bin"];
+        NSData *cur = [NSData dataWithContentsOfFile:f];
+        if (!cur || [cur length] == 0) return NO;
+        if (gNodeWrote && [cur isEqualToData:gNodeWrote]) return NO;
+        return YES;
+
+    } @catch (NSException *e) { return NO; }
+
+}
+
+static void rb_autotap_tick(void);
+
+// 点击序列：先点连接按钮（App 会跳节点列表），等它画完再点列表第一项。
+// 三组不同高度轮着来 —— 猜不准布局就多猜几次，点错最多没反应。
+static const double kRbTapPos[RB_TAP_N][2] = {
+    { 0.50, 0.72 }, { 0.50, 0.22 },
+    { 0.50, 0.62 }, { 0.50, 0.23 },
+    { 0.50, 0.82 }, { 0.50, 0.24 },
+    { 0.50, 0.50 }, { 0.50, 0.30 }
+};
+
+static void rb_autotap_after(int next) {
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(RB_AUTOTAP_GAP * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+
+        @autoreleasepool {
+
+            if (gTapDone) return;
+
+            if (rb_node_file_changed()) {
+
+                gTapHit  = 1;
+                gTapDone = 1;
+                rb_log("[TAP] ✅ 点到节点了（第 %d 下之后节点文件变了）—— App 已经去申请新凭据，"
+                       "立刻拉隧道", gTapStep + 1);
+                rb_start_vpn_once(1);
+                return;
+
+            }
+
+            if (rb_vpn_status() == 3 && gRateKBps >= 150.0) {
+
+                gTapDone = 1;
+                rb_log("[TAP] 已经连上且速率 %.1f KB/s，不用再点了", gRateKBps);
+                return;
+
+            }
+
+            gTapStep = next;
+            rb_autotap_tick();
+
+        }
+
+    });
+
+}
+
+static void rb_autotap_tick(void) {
+
+    if (!RB_AUTOTAP_ON || gTapDone) return;
+
+    if (gTapStep >= RB_TAP_N) {
+
+        gTapDone = 1;
+        rb_log("[TAP] ❌ %d 下都点空了（节点文件一直没变）—— 这套坐标在你手机上没命中，"
+               "下一版改用别的路", RB_TAP_N);
+        return;
+
+    }
+
+    double nx = kRbTapPos[gTapStep][0], ny = kRbTapPos[gTapStep][1];
+    BOOL ok = rb_tap_at(nx, ny);
+
+    rb_log("[TAP] 第 %d/%d 下：屏幕 (%.0f%%, %.0f%%) %s", gTapStep + 1, RB_TAP_N,
+           nx * 100.0, ny * 100.0, ok ? "已发送" : "发不出去");
+
+    if (!ok && gTapStep == 0) {
+        // 第一下就发不出去，说明这套私有 API 在你系统上不可用，别刷 8 条日志
+        gTapDone = 1;
+        return;
+    }
+
+    rb_autotap_after(gTapStep + 1);
+
+}
+
+static void rb_autotap_boot(void) {
+
+    if (!RB_AUTOTAP_ON) return;
+    if (gTapStarted) return;
+    gTapStarted = 1;
+
+    @try {
+
+        double lw = [[rb_state() objectForKey:@"lastWipeTs"] doubleValue];
+        if (lw <= 0 || rb_now() - lw > 300.0) {
+            rb_log("[TAP] 距上次抹除太久（%.0f 秒），不在抹除周期内，不点", (lw > 0) ? rb_now() - lw : -1.0);
+            gTapDone = 1;
+            return;
+        }
+
+    } @catch (NSException *e) { }
+
+    rb_log("[TAP] %.0f 秒后开始自动点节点（一共 %d 下，每下隔 %.0f 秒）："
+           "先点连接按钮，再点节点列表第一项", (double)RB_AUTOTAP_DELAY, RB_TAP_N,
+           (double)RB_AUTOTAP_GAP);
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)(RB_AUTOTAP_DELAY * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+
+        @autoreleasepool {
+            gTapStep = 0;
+            rb_autotap_tick();
+        }
+
+    });
+
+}
+
+// ==================== v81 全量诊断（rb-full.txt） ====================
+// 目的：一次性把「App 到底把节点凭据藏在哪」查清楚，不用再一轮一轮猜。
+// 内容包括：沙盒/App Group 文件树、Preferences 所有键值、NSUserDefaults 全量、
+//           keychain 每一项（含值，base64）、节点目录所有文件 hex、VPN 配置摘要。
+// 纯只读，不改任何东西。
+
+static void rb_full_tree(NSMutableString *o, NSString *dir, int depth) {
+
+    if (!dir || depth > 4) return;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *it = [fm contentsOfDirectoryAtPath:dir error:NULL];
+    if (!it) return;
+
+    for (NSString *nm in [it sortedArrayUsingSelector:@selector(compare:)]) {
+
+        NSString *p = [dir stringByAppendingPathComponent:nm];
+        NSDictionary *a = [fm attributesOfItemAtPath:p error:NULL];
+        if (!a) continue;
+
+        NSString *type = [a objectForKey:NSFileType];
+        unsigned long long sz = [a fileSize];
+        NSDate *mt = [a objectForKey:NSFileModificationDate];
+
+        [o appendFormat:@"%*s%@  %@  %llu B  %@\n", depth * 2, "",
+         [type isEqualToString:NSFileTypeDirectory] ? @"[D]" : @"[F]", nm, sz, mt];
+
+        if ([type isEqualToString:NSFileTypeDirectory])
+            rb_full_tree(o, p, depth + 1);
+
+    }
+
+}
+
+static void rb_full_dump_files(NSMutableString *o, NSString *dir, int depth) {
+
+    if (!dir || depth > 3) return;
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *it = [fm contentsOfDirectoryAtPath:dir error:NULL];
+    if (!it) return;
+
+    for (NSString *nm in [it sortedArrayUsingSelector:@selector(compare:)]) {
+
+        NSString *p = [dir stringByAppendingPathComponent:nm];
+        NSDictionary *a = [fm attributesOfItemAtPath:p error:NULL];
+        if (!a) continue;
+
+        if ([[a objectForKey:NSFileType] isEqualToString:NSFileTypeDirectory]) {
+            rb_full_dump_files(o, p, depth + 1);
+            continue;
+        }
+
+        NSData *d = [NSData dataWithContentsOfFile:p];
+        if (!d || [d length] == 0 || [d length] > 65536) continue;
+
+        NSMutableString *hx = [NSMutableString string];
+        const uint8_t *b = (const uint8_t *)[d bytes];
+        NSUInteger i, n = [d length];
+        for (i = 0; i < n; i++) [hx appendFormat:@"%02x", b[i]];
+        [o appendFormat:@"%@  (%lu B)\n%@\n", p, (unsigned long)n, hx];
+
+    }
+
+}
+
+// 这个函数在 rb_wipe_all 里会用到，但定义要放在后面 —— 上面已有前向声明
+static void rb_full_dump(const char *why) {
+
+    @try {
+
+        NSMutableString *o = [NSMutableString stringWithCapacity:(1u << 18)];
+        NSString *h = NSHomeDirectory();
+
+        [o appendFormat:@"\n\n########## v81 全量诊断 @ %@  (%s) ##########\n",
+                       [NSDate date], why ? why : ""];
+
+        // 1. 沙盒文件树
+        [o appendString:@"\n===== 沙盒文件树 =====\n"];
+        rb_full_tree(o, h, 0);
+
+        // 2. Preferences 里每个 plist 的完整内容（节点凭据最可能藏这儿）
+        [o appendString:@"\n===== Library/Preferences 全部键值 =====\n"];
+        {
+            NSString *pd = [[h stringByAppendingPathComponent:@"Library"]
+                            stringByAppendingPathComponent:@"Preferences"];
+            NSFileManager *fm = [NSFileManager defaultManager];
+            for (NSString *nm in ([fm contentsOfDirectoryAtPath:pd error:NULL] ?: @[])) {
+                NSString *p = [pd stringByAppendingPathComponent:nm];
+                NSDictionary *pl = [NSDictionary dictionaryWithContentsOfFile:p];
+                if (pl) {
+                    [o appendFormat:@"--- %@ ---\n%@\n", nm, pl];
+                } else {
+                    NSData *d = [NSData dataWithContentsOfFile:p];
+                    [o appendFormat:@"--- %@ --- (非 plist，%lu B)\n", nm,
+                                   (unsigned long)[d length]];
+                }
+            }
+        }
+
+        // 3. NSUserDefaults 全量（standard + app group + flutter）
+        [o appendString:@"\n===== NSUserDefaults 全量 =====\n"];
+        {
+            NSDictionary *std = [[NSUserDefaults standardUserDefaults] dictionaryRepresentation];
+            [o appendFormat:@"[standard]\n%@\n", std];
+
+            @try {
+                NSUserDefaults *gd = [[NSUserDefaults alloc] initWithSuiteName:RB_GROUP_ID];
+                if (gd) {
+                    [o appendFormat:@"[group %@]\n%@\n", RB_GROUP_ID,
+                                   [gd dictionaryRepresentation]];
+                    [gd release];
+                }
+            } @catch (NSException *e) { }
+        }
+
+        // 4. keychain 每一项（连值一起，base64）
+        [o appendString:@"\n===== keychain 全量（含值） =====\n"];
+        {
+            NSArray *classes = [NSArray arrayWithObjects:
+                                (id)kSecClassGenericPassword, (id)kSecClassInternetPassword,
+                                (id)kSecClassKey, (id)kSecClassCertificate,
+                                (id)kSecClassIdentity, nil];
+            for (id cls in classes) {
+                NSDictionary *q = [NSDictionary dictionaryWithObjectsAndKeys:
+                                   cls, (id)kSecClass,
+                                   (id)kSecMatchLimitAll, (id)kSecMatchLimit,
+                                   (id)kCFBooleanTrue, (id)kSecReturnAttributes,
+                                   (id)kCFBooleanTrue, (id)kSecReturnData,
+                                   nil];
+                CFTypeRef raw = NULL;
+                if (SecItemCopyMatching((CFDictionaryRef)q, &raw) != errSecSuccess || !raw) continue;
+                id obj = [(id)raw autorelease];
+                if (![obj isKindOfClass:[NSArray class]]) continue;
+                for (NSDictionary *it in (NSArray *)obj) {
+                    NSData *dd = [it objectForKey:(id)kSecValueData];
+                    NSString *b64 = dd ? [dd base64EncodedStringWithOptions:0] : @"(nil)";
+                    [o appendFormat:@"class=%@ svc=%@ acct=%@ agrp=%@\n  data=%@\n  txt=%@\n",
+                                   cls,
+                                   [it objectForKey:(id)kSecAttrService] ?: @"(nil)",
+                                   [it objectForKey:(id)kSecAttrAccount] ?: @"(nil)",
+                                   [it objectForKey:(id)kSecAttrAccessGroup] ?: @"(nil)",
+                                   b64,
+                                   (dd && [dd length] < 512)
+                                     ? ([[[NSString alloc] initWithData:dd
+                                                               encoding:NSUTF8StringEncoding]
+                                         autorelease] ?: @"(binary)")
+                                     : @"(large/binary)"];
+                }
+            }
+        }
+
+        // 5. App Group 容器
+        [o appendString:@"\n===== App Group 容器 =====\n"];
+        @try {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            SEL sel = sel_registerName("containerURLForSecurityApplicationGroupIdentifier:");
+            if ([fm respondsToSelector:sel]) {
+                NSURL *gu = ((NSURL *(*)(id, SEL, id))objc_msgSend)(fm, sel, RB_GROUP_ID);
+                if (gu) rb_full_tree(o, [gu path], 0);
+            }
+        } @catch (NSException *e) { }
+
+        // 6. 节点目录里所有文件 hex（凭据到底写在哪一份里，一看就知道）
+        [o appendString:@"\n===== 节点目录全部文件 hex =====\n"];
+        rb_full_dump_files(o, rb_node_dir(), 0);
+
+        // 7. VPN 配置摘要
+        [o appendString:@"\n===== NE 配置 =====\n"];
+        @try {
+            Class C = objc_getClass("NETunnelProviderManager");
+            if (C) {
+                __block int fin = 0;
+                void (^h2)(NSArray *, NSError *) = ^(NSArray *mans, NSError *err) {
+                    (void)err;
+                    NSMutableString *t = [NSMutableString string];
+                    NSUInteger idx = 0;
+                    for (id m in mans) {
+                        id pr = nil, pc = nil;
+                        @try { pr = [m valueForKey:@"protocolConfiguration"]; } @catch (NSException *e) { }
+                        @try { pc = [pr valueForKey:@"providerConfiguration"]; } @catch (NSException *e) { }
+                        [t appendFormat:@"[%lu] enabled=%d onDemand=%d pc=%@\n",
+                         (unsigned long)idx++,
+                         [[m valueForKey:@"enabled"] boolValue] ? 1 : 0,
+                         [[m valueForKey:@"onDemandEnabled"] boolValue] ? 1 : 0, pc];
+                    }
+                    NSString *fp = [NSHomeDirectory()
+                                    stringByAppendingPathComponent:@"Documents/rb-full.txt"];
+                    NSString *old = [NSString stringWithContentsOfFile:fp
+                                                              encoding:NSUTF8StringEncoding
+                                                                 error:NULL] ?: @"";
+                    NSString *all = [NSString stringWithFormat:@"%@%@\n%@\n", old, o, t];
+                    if ([all length] > 600000)
+                        all = [all substringFromIndex:[all length] - 600000];
+                    [all writeToFile:fp atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+                    fin = 1;
+                };
+                ((void (*)(id, SEL, id))objc_msgSend)(
+                    C, sel_registerName("loadAllFromPreferencesWithCompletionHandler:"), h2);
+                if (!fin) {
+                    // 回调没同步跑（Normal），先按当前内容落地，后面还会再 dump 一次
+                    NSString *fp = [NSHomeDirectory()
+                                    stringByAppendingPathComponent:@"Documents/rb-full.txt"];
+                    NSString *old = [NSString stringWithContentsOfFile:fp
+                                                              encoding:NSUTF8StringEncoding
+                                                                 error:NULL] ?: @"";
+                    NSString *all = [NSString stringWithFormat:@"%@%@\n", old, o];
+                    if ([all length] > 600000)
+                        all = [all substringFromIndex:[all length] - 600000];
+                    [all writeToFile:fp atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+                }
+            }
+        } @catch (NSException *e) { }
+
+    } @catch (NSException *e) {
+        rb_log("全量诊断失败：%s", [[e reason] UTF8String]);
+    }
+
+}
+
 __attribute__((constructor))
 
 static void rb_init(void) {
@@ -7829,86 +8309,21 @@ static void rb_init(void) {
 
         if (rb_just_wiped()) {
 
-            // v70：照常写回节点文件（否则 App 一定弹节点选择页、要你手点），
-            // 但写回时授权串已被作废 —— 有节点、无有效授权，让 App 用新身份重新签发。
-            // v77：写回，但用的是「剥掉凭据 f14.f2 + 授权串 f22」的版本。
-            //
-            // 为什么不能干脆不写回：rely_shim.m 下面那段 v66 的注释是踩过坑写下的——
-            // 「系统 on-demand 在 1 秒内就把隧道拉起了，provider 起来时节点文件还没
-            // 写回 → 永远卡「连接中」」。抹后留空就是把那个坑原封不动复活一次，
-            // 而且 App 还可能弹节点选择页。
-            //
-            // 写回剥干净的版本：provider 起来时有 IP/端口/名称可用，不会卡连接中；
-            // 但凭据和授权都没了，App 要么自己去 IssueNodeToken，要么连不上重试。
-            // v79：不再写回旧节点文件。根因在 rb-req.txt 第 12 帧（#10 out/ff 370 字节）：
-            // 服务端给新身份推荐的节点是 f71 里那 4 个 —— 38.246.249.177(香港 61ms)、
-            // 23.129.140.69(首尔 66ms / 东京 66ms)、38.58.56.69(洛杉矶 166ms)；
-            // 而同一帧 f62 是我们实际连的 103.182.96.45，它压根不在推荐列表里。
-            // 旧节点文件把新身份钉在这个非推荐节点上 → 直接吃福利档 30 KB/s。
-            // 抹前同一 IP 能跑 8190 KB/s，说明节点本身没坏，是「新身份连非推荐节点」的问题。
-            // 手动切节点就是走这份推荐列表，所以只有手动切才恢复 —— 现在把这一步交给 App。
-            // v80：抹后一定要有节点文件。pid=21319 就是「抹后启动就写回」
-            // 的配置，实测 7300.9 KB/s / 139.4 MB；而 v79「清空等 App 自己选」
-            // 的 pid=21325 全程没有文件，状态钉在 2，最后连接超时。
-            rb_log("这次是抹数据后启动：启动就写回节点文件（v80）—— 磁盘上没有节点文件时，"
-                   "provider 起来无处可连，隧道会一直停在「正在连接」直到超时");
+            // v81：写回「原版」（带旧凭据）—— v80 写剥版的结果是 App 4 秒内自己就把
+            // 旧凭据补回去了（日志「检测到 App 已选中新节点（319 字节）」），剥了等于白剥，
+            // 还白多一次重写。磁盘上有文件，provider 起来才不会卡在「正在连接」。
+            rb_log("这次是抹数据后启动（v81）：写回原版节点文件，拉一次，之后不再拆隧道");
 
-            rb_node_files_restore();
+            rb_node_files_restore_raw();
 
             rb_prefs_restore();
 
-            // App 一旦自己重新申请并重写文件，立刻拉隧道
+            // App 一旦自己重写文件（真去申请了新凭据），立刻拉起隧道
             rb_node_watch_new(RB_NODE_WATCH_MAX);
 
-            // v77 自检（安全网）：剥掉凭据是个假设 —— 万一 App 压根不去重新申请，
-            // 就会永远握不上手，比限速更糟。45 秒后看文件内容：
-            // 还是我们写的那份剥版（跟 gNodeWrote 一致）说明它没动，
-            // 立刻原样写回带凭据的版本，先保住「能连」。
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                         (int64_t)(45 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-
-                @autoreleasepool {
-
-                    NSString *f = [rb_node_dir()
-
-                                   stringByAppendingPathComponent:@"currentNodeWithReason.bin"];
-
-                    NSData *cur = [NSData dataWithContentsOfFile:f];
-
-                    // 文件不存在 = App 把它删了准备重选，但 45 秒了还没写回来，
-                    // 一样走安全网。
-                    if (!cur || (gNodeWrote && [cur isEqualToData:gNodeWrote])) {
-
-                        // v79：抹后我们把节点文件清空了，正常情况下 App 会从服务端
-                        // 推荐列表重选并写回来。45 秒还没有 = 它没去选（可能进程没活）。
-                        // 写回快照并立刻拉起 —— 先保住能连，速度慢总比断网好。
-                        rb_log("自检安全网：45 秒了 App 还没选新节点 —— 写回快照并拉起隧道");
-
-                        if (rb_node_files_restore_raw()) {
-
-                            rb_log("自检安全网：已写回旧节点文件（带凭据）");
-
-                        } else {
-
-                            rb_log("自检安全网：没有可用快照，只能直接拉起试试");
-
-                        }
-
-                        rb_start_vpn_once(1);
-
-                    } else if (cur && gNodeWrote) {
-
-                        rb_log("自检安全网：App 已经自己重写节点文件（%lu 字节，"
-                               "不是我们写的 %lu 字节）—— 说明剥凭据奏效，它去重新申请了",
-
-                               (unsigned long)[cur length], (unsigned long)[gNodeWrote length]);
-
-                    }
-
-                }
-
-            });
+            // v81：抹完 RB_AUTOTAP_DELAY 秒开始自动点节点 ——
+            // 节点凭据只能由 App 自己 IssueNodeToken 签发，而那请求只在「点节点」时发。
+            rb_autotap_boot();
 
         } else {
 
@@ -7959,13 +8374,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v80 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log("rb-shim v81 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v80 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log("rb-shim v81 已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "流量阈值 %.0f MB）",
 
@@ -8035,8 +8450,17 @@ static void rb_init(void) {
 
                    (double)RB_GRACE_FAST_SEC, (double)RB_COOL_FAST_SEC);
 
-            // v80：抹后就把自愈阶梯挂上，H1~H5 逐级试，日志带编号
+            // v81：自愈阶梯整体停用（RB_HEAL_ON=0）—— rb-shim(21) 里它把隧道
+            // stop/start 了七八次，最后连「自动连接开关」都切到关，界面永远「正在连接」。
             rb_heal_boot();
+
+            // v81：抹后 12 秒把「App 重新长回来的东西」全量导一份，
+            // 看旧节点凭据到底从哪个文件 / keychain 项复活的。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                         (int64_t)(12 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                @autoreleasepool { rb_full_dump("抹后可恢复现场"); }
+            });
 
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
 
