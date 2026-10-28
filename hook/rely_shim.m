@@ -106,6 +106,34 @@
 
 
 
+// ==================== v86 插件模式 ====================
+// 编成独立 dylib 直接注入主 App（TrollFools / 巨魔注入器），不再替换
+// rely_transport.framework。用 -DRB_PLUGIN=1 编译；不定义就是原来的
+// 「替换 framework」版，行为与 v85 完全一致。
+#ifndef RB_PLUGIN
+#define RB_PLUGIN 0
+#endif
+
+#if RB_PLUGIN
+/* 这 8 个函数是 rely_transport.framework 的公开接口。插件模式下 framework
+   原封不动地留在原地，主 App 的调用绑定在它身上（two-level namespace，
+   ordinal 固定），这里就算导出同名符号也接不到调用 —— 留着只会让
+   dlsym(RTLD_DEFAULT) 之类撞上我们的壳。全部改名，插件里它们是死代码，
+   唯一的用处是 load_orig() 之后手动调（当前没有任何调用点）。 */
+#define rely_transport_new                   rbplug_transport_new
+#define rely_transport_request               rbplug_transport_request
+#define rely_transport_send_fire_and_forget  rbplug_transport_fire
+#define rely_transport_free                  rbplug_transport_free
+#define rely_transport_free_buffer           rbplug_transport_freebuf
+#define rely_transport_is_connected          rbplug_transport_isconn
+#define rely_transport_force_reconnect       rbplug_transport_force
+#define rely_transport_set_network_available rbplug_transport_setnet
+#define RB_TAG "rb-plugin v1"
+#else
+#define RB_TAG "rb-shim v85"
+#endif
+
+
 #pragma mark - 配置区（要改就改这里，没有环境变量）
 
 
@@ -7105,6 +7133,26 @@ FWD(rely_transport_set_network_available, gSetNetworkAvailable)
 
 static void compute_orig_path(void) {
 
+#if RB_PLUGIN
+    // 插件模式：framework 里的原实现没被动过，就在它自己的路径里。
+    {
+        char pexe[1024];
+        uint32_t psz = (uint32_t)sizeof(pexe);
+        if (_NSGetExecutablePath(pexe, &psz) == 0) {
+            char *pslash = strrchr(pexe, '/');
+            if (pslash) {
+                *pslash = '\0';
+                snprintf(gOrigPath, sizeof(gOrigPath),
+                         "%s/Frameworks/rely_transport.framework/rely_transport", pexe);
+                if (access(gOrigPath, F_OK) == 0) return;
+                rb_log("插件模式：原版 framework 不在 %s", gOrigPath);
+            }
+        }
+    }
+    gOrigPath[0] = '\0';
+    return;
+#endif
+
     Dl_info info;
 
     if (dladdr((void *)(uintptr_t)&compute_orig_path, &info) && info.dli_fname) {
@@ -7151,6 +7199,35 @@ static void compute_orig_path(void) {
 
 
 
+#if RB_PLUGIN
+// 插件版专用：判断当前这个 App 是不是被 tipa 版换过 framework。
+// 换过的标志是 framework 目录里多出一个 rely_transport_orig（原实现被改名备份）。
+// 这一步必须在动手之前做 —— 两套逻辑同时跑会抢着抹数据、互相把节点文件写花。
+static int rb_plugin_framework_replaced(void) {
+
+    char pexe[1024];
+
+    uint32_t psz = (uint32_t)sizeof(pexe);
+
+    if (_NSGetExecutablePath(pexe, &psz) != 0) return 0;
+
+    char *pslash = strrchr(pexe, '/');
+
+    if (!pslash) return 0;
+
+    *pslash = '\0';
+
+    char p[1200];
+
+    snprintf(p, sizeof(p), "%s/Frameworks/rely_transport.framework/rely_transport_orig", pexe);
+
+    return access(p, F_OK) == 0;
+
+}
+#endif
+
+
+
 static void *resolve(const char *name) {
 
     return gLib ? dlsym(gLib, name) : NULL;
@@ -7167,11 +7244,23 @@ static int load_orig(void) {
 
     if (!gOrigPath[0]) return 0;
 
+#if RB_PLUGIN
+    // 插件模式：framework 早被主 App 加载过了，这里只要一个 handle。
+    // RTLD_NOLOAD = 只认已经加载的那个 image，绝不重新加载一遍
+    // （路径写法不同时 dyld 有时会当成两个库，多一份没意义）。
+    gLib = dlopen(gOrigPath, RTLD_NOW | RTLD_LOCAL | RTLD_NOLOAD);
+#else
     gLib = dlopen(gOrigPath, RTLD_NOW | RTLD_LOCAL);
+#endif
 
     if (!gLib) {
 
+#if RB_PLUGIN
+        rb_log("插件模式：拿不到 framework 的 handle（%s），"
+               "只影响内部状态查询，抹数据/自拉起照常工作", gOrigPath);
+#else
         rb_log("dlopen 失败 %s: %s", gOrigPath, dlerror());
+#endif
 
         return 0;
 
@@ -8678,6 +8767,19 @@ static void rb_init(void) {
 
         gBootAt = rb_now();
 
+#if RB_PLUGIN
+        if (rb_plugin_framework_replaced()) {
+
+            rb_log("插件自停用：这个 App 已经是 tipa 版（framework 被换过，旁边有 "
+                   "rely_transport_orig），再叠一层插件会两套逻辑抢着抹数据。\n"
+                   "  要用插件版：先用 TrollStore 装回原版 RelyVPN 5.0.3.ipa，"
+                   "再注入本 dylib。");
+
+            return;
+
+        }
+#endif
+
         if (rb_just_wiped()) {
 
             // v81：写回「原版」（带旧凭据）—— v80 写剥版的结果是 App 4 秒内自己就把
@@ -8753,13 +8855,13 @@ static void rb_init(void) {
 
         if (gStopped) {
 
-            rb_log("rb-shim v85 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
+            rb_log(RB_TAG " 已停用（只读转发，不做任何事）pid=%d", (int)getpid());
 
             rb_state_save(st);
 
         } else {
 
-            rb_log("rb-shim v85 精简版已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
+            rb_log(RB_TAG " 精简版已加载 pid=%d（已抹除 %d 次，本次启动第 %d 次，"
 
                    "额度阈值 %.0f MB）—— 只保留：归零→抹数据→自拉起，不自动重连",
 
