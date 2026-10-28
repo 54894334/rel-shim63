@@ -8724,6 +8724,21 @@ static void rb_init(void) {
 
 
 
+        // v85：精简版第一次启动 —— 先把旧版留下的熔断标记清掉。
+        // 不清的话，之前跑挂过（autoOff=YES 存在 rb_state.plist 里，抹数据也不会删它）
+        // 的话，新包装上就是「只读转发、什么都不做」，用户会以为彻底坏了。
+        if (![[st objectForKey:@"v85reset"] boolValue]) {
+            if ([[st objectForKey:@"autoOff"] boolValue] ||
+                [[st objectForKey:@"rapidCount"] intValue] > 0) {
+                rb_log("v85 首次启动：清掉旧版熔断标记（autoOff / rapidCount）");
+            }
+            [st removeObjectForKey:@"autoOff"];
+            [st removeObjectForKey:@"rapidCount"];
+            [st removeObjectForKey:@"rapidTs"];
+            [st setObject:[NSNumber numberWithBool:YES] forKey:@"v85reset"];
+            rb_state_save(st);
+        }
+
         if ([[st objectForKey:@"autoOff"] boolValue]) gStopped = 1;
 
         if (bct > RB_MAX_BOOT_LOOP) {
