@@ -3731,9 +3731,13 @@ static id rb_cap_build_opts(void) {
         }
         if ([base isKindOfClass:[NSDictionary class]])
             [d addEntriesFromDictionary:(NSDictionary *)base];
-        // 本地节点文件才是「当前选中的节点」，它优先于上次存下的旧值
-        NSString *code = rb_local_node_code();
-        if (code) [d setObject:code forKey:@"initial_node_code"];
+        // 优先原样重放上次成功那份（里面带着 provider 需要的节点数据）；
+        // 只有它完全没有节点字段时，才用本地节点文件里的代号补一个。
+        NSString *cur = [d objectForKey:@"initial_node_code"];
+        if (![cur isKindOfClass:[NSString class]] || [cur length] == 0) {
+            NSString *code = rb_local_node_code();
+            if (code) [d setObject:code forKey:@"initial_node_code"];
+        }
     } @catch (NSException *e) { }
     return [d count] ? d : nil;
 }
